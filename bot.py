@@ -26,7 +26,7 @@ except ImportError:
     OCR_AVAILABLE = False
 
 # ==================== CONFIG ====================
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "ВАШ_ТОКЕН_ЗДЕСЬ")
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
 DB_PATH = "expenses.db"
 DEFAULT_CATEGORIES = [
     "Продукты", "Транспорт", "Кафе", "Развлечения",
