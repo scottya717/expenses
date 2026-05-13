@@ -2,10 +2,14 @@ import os
 import re
 import sqlite3
 import csv
+import json
+import base64
 import logging
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Optional, List, Tuple
+from io import BytesIO
 
+import aiohttp
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -17,23 +21,23 @@ from telegram.ext import (
     filters,
 )
 from aiohttp import web
-
-try:
-    import pytesseract
-    from PIL import Image
-    OCR_AVAILABLE = True
-except ImportError:
-    OCR_AVAILABLE = False
+from PIL import Image
 
 # ==================== CONFIG ====================
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
+YANDEX_API_KEY = os.environ.get("YANDEX_API_KEY")
+YANDEX_FOLDER_ID = os.environ.get("YANDEX_FOLDER_ID")
+
 DB_PATH = "expenses.db"
 DEFAULT_CATEGORIES = [
     "Продукты", "Транспорт", "Кафе", "Развлечения",
     "Здоровье", "Одежда", "Коммунальные", "Другое"
 ]
 
-WAITING_AMOUNT, WAITING_CATEGORY, WAITING_EDIT_SELECT, WAITING_EDIT_FIELD, WAITING_EDIT_VALUE = range(5)
+# Состояния
+WAITING_AMOUNT, WAITING_CATEGORY, WAITING_DATE, \
+WAITING_EDIT_SELECT, WAITING_EDIT_FIELD, WAITING_EDIT_VALUE, \
+WAITING_SCREENSHOT_DATE, WAITING_SCREENSHOT_CONFIRM = range(8)
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -59,12 +63,13 @@ def init_db():
     conn.commit()
     conn.close()
 
-def add_expense(user_id: int, amount: float, category: str, description: str = ""):
+def add_expense(user_id: int, amount: float, category: str, description: str = "", date: Optional[str] = None):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
+    d = date or datetime.now().isoformat()
     c.execute(
         "INSERT INTO expenses (user_id, amount, category, description, date) VALUES (?, ?, ?, ?, ?)",
-        (user_id, amount, category, description, datetime.now().isoformat()),
+        (user_id, amount, category, description, d),
     )
     conn.commit()
     conn.close()
@@ -133,65 +138,296 @@ def get_summary_by_category(user_id: int, days: int):
     conn.close()
     return rows
 
-# ==================== OCR ====================
-def extract_amount_from_text(text: str) -> Optional[float]:
-    t = text.lower().replace(" ", "").replace(",", ".")
-    patterns = [r'(\d[\d]*[.]?\d*)\s*[₽рp]', r'(\d{3,}[\d]*[.]?\d*)']
-    for p in patterns:
-        m = re.findall(p, t)
-        if m:
+# ==================== YANDEX OCR ====================
+async def yandex_ocr(image_bytes: bytes) -> str:
+    """Распознаёт текст через Yandex Vision OCR"""
+    if not YANDEX_API_KEY or not YANDEX_FOLDER_ID:
+        return ""
+    
+    encoded = base64.b64encode(image_bytes).decode("utf-8")
+    body = {
+        "folderId": YANDEX_FOLDER_ID,
+        "analyzeSpecs": [{
+            "content": encoded,
+            "features": [{"type": "TEXT_DETECTION", "textDetectionConfig": {"languageCodes": ["ru", "en"]}}]
+        }]
+    }
+    
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            "https://vision.api.cloud.yandex.net/vision/v1/batchAnalyze",
+            headers={"Authorization": f"Api-Key {YANDEX_API_KEY}", "Content-Type": "application/json"},
+            json=body,
+            timeout=aiohttp.ClientTimeout(total=30)
+        ) as resp:
+            if resp.status != 200:
+                logger.error(f"Yandex OCR error: {resp.status}")
+                return ""
+            data = await resp.json()
+            texts = []
+            for result in data.get("results", []):
+                for page in result.get("results", []):
+                    for block in page.get("textDetection", {}).get("pages", [{}])[0].get("blocks", []):
+                        for line in block.get("lines", []):
+                            line_text = " ".join(w.get("text", "") for w in line.get("words", []))
+                            texts.append(line_text)
+            return "\n".join(texts)
+
+def parse_expenses_from_text(text: str) -> List[Tuple[str, float]]:
+    """Извлекает пары (описание, сумма) из текста"""
+    lines = text.split("\n")
+    expenses = []
+    
+    for line in lines:
+        line = line.strip()
+        if not line or len(line) < 3:
+            continue
+        
+        # Ищем число в конце или середине строки
+        # Паттерны: "Продукты 1250", "Кафе - 340 руб", "Такси 1 250 ₽"
+        match = re.search(r'^(.*?)\s+([\d\s]+[.,]?\d*)\s*[₽рp]?$', line)
+        if not match:
+            match = re.search(r'^(.*?)\s*[-–:]\s*([\d\s]+[.,]?\d*)\s*[₽рp]?$', line)
+        
+        if match:
+            desc = match.group(1).strip()
+            amount_str = match.group(2).replace(" ", "").replace(",", ".")
             try:
-                return float(m[0])
+                amount = float(amount_str)
+                if amount > 0 and amount < 1000000:  # разумные пределы
+                    expenses.append((desc, amount))
             except ValueError:
                 continue
-    return None
+    
+    return expenses
 
-async def process_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not OCR_AVAILABLE:
-        await update.message.reply_text("⚠️ OCR не доступен.")
-        return
+def guess_category(description: str) -> str:
+    """Угадывает категорию по описанию"""
+    desc_lower = description.lower()
+    keywords = {
+        "Продукты": ["продукт", "пятероч", "магнит", "перекрест", "азбука", "лента", " Spar ", "вкусно", "еда", "овощ", "мясо", "молоко", "хлеб", "овощи", "фрукты", "супермаркет", "гипер", "покупка"],
+        "Транспорт": ["такси", "метро", "автобус", "трамвай", "электричк", "поезд", "билет", "яндекс такси", "uber", "ситимобил", "бензин", "заправк", "парковка", "транспорт"],
+        "Кафе": ["кафе", "ресторан", "кофе", "кофейня", "шоколадница", "старбакс", "kfc", "макдоналдс", "бургер", "пицца", "суши", "доставка", "обед", "ужин", "покушать", "поесть"],
+        "Развлечения": ["кино", "театр", "концерт", "игра", "steam", "playstation", "xbox", "книг", "подписка", "netflix", "spotify", "музыка", "развлеч"],
+        "Здоровье": ["аптек", "лекарств", "врач", "больниц", "клиник", "анализ", "массаж", "стоматолог", "зуб", "терапевт", "медицин", "здоровье"],
+        "Одежда": ["одежда", "обувь", "zara", "h&m", "уникло", "спортмастер", "lamoda", "wildberries", "ozon", "шмотк", "куртк", "джинс", "футболк"],
+        "Коммунальные": ["жкх", "коммунал", "интернет", "свет", "вода", "газ", "аренда", "ипотек", "квартплат", "тинькофф жкх"],
+    }
+    
+    for cat, words in keywords.items():
+        for word in words:
+            if word in desc_lower:
+                return cat
+    return "Другое"
+
+# ==================== SCREENSHOT FLOW ====================
+async def process_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает скриншот дня — распознаёт несколько трат"""
     photo = update.message.photo[-1]
     file = await context.bot.get_file(photo.file_id)
-    path = f"photo_{update.message.from_user.id}.jpg"
-    await file.download_to_drive(path)
-    try:
-        image = Image.open(path)
-        text = pytesseract.image_to_string(image, lang="rus+eng")
-        amount = extract_amount_from_text(text)
-        if amount:
-            context.user_data["ocr_amount"] = amount
-            context.user_data["ocr_description"] = text[:200]
-            keyboard = [
-                [InlineKeyboardButton(cat, callback_data=f"ocr_cat_{cat}") for cat in DEFAULT_CATEGORIES[i:i+2]]
-                for i in range(0, len(DEFAULT_CATEGORIES), 2)
-            ]
-            keyboard.append([InlineKeyboardButton("❌ Отмена", callback_data="ocr_cancel")])
-            await update.message.reply_text(
-                f"📸 Распознано: *{amount:.2f} ₽*\n_{text[:100].replace(chr(10), ' ')}..._\n\nВыбери категорию:",
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode="Markdown",
-            )
-        else:
-            await update.message.reply_text("❌ Сумма не распознана. Попробуй /add")
-    except Exception as e:
-        logger.error(f"OCR error: {e}")
-        await update.message.reply_text("❌ Ошибка обработки.")
-    finally:
-        if os.path.exists(path):
-            os.remove(path)
+    
+    # Скачиваем в память
+    bio = BytesIO()
+    await file.download_to_memory(bio)
+    bio.seek(0)
+    image_bytes = bio.read()
+    
+    # Распознаём
+    await update.message.reply_text("🔍 Распознаю текст...")
+    text = await yandex_ocr(image_bytes)
+    
+    if not text:
+        await update.message.reply_text(
+            "❌ Не удалось распознать текст.\n\n"
+            "Убедись, что:\n"
+            "• На скриншоте видны суммы\n"
+            "• Текст не размыт\n\n"
+            "Или добавь вручную: /add"
+        )
+        return
+    
+    # Парсим траты
+    expenses = parse_expenses_from_text(text)
+    
+    if not expenses:
+        await update.message.reply_text(
+            f"❌ Не нашёл трат в тексте.\n\nВот что распознал:\n```\n{text[:500]}\n```\n\nПопробуй /add",
+            parse_mode="Markdown"
+        )
+        return
+    
+    # Сохраняем для следующего шага
+    context.user_data["screenshot_expenses"] = expenses
+    context.user_data["screenshot_text"] = text
+    
+    # Показываем что распознали
+    msg = "📸 *Распознано:*\n\n"
+    for i, (desc, amount) in enumerate(expenses, 1):
+        cat = guess_category(desc)
+        msg += f"{i}. {desc} — *{amount:.0f} ₽* ({cat})\n"
+    
+    msg += f"\nВсего трат: {len(expenses)}\n\nУкажи дату (ДД.ММ.YYYY) или напиши 'сегодня':"
+    
+    await update.message.reply_text(msg, parse_mode="Markdown")
+    return WAITING_SCREENSHOT_DATE
 
-# ==================== HANDLERS ====================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "👋 Бот учёта трат!\n\n"
-        "📸 Отправь скриншот чека\n"
-        "✏️ /add — вручную\n"
-        "📊 /week /month /categories — отчёты\n"
-        "📝 /list — редактировать\n"
-        "📤 /export — бэкап CSV\n\n"
-        "Категории: " + ", ".join(DEFAULT_CATEGORIES)
+async def screenshot_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Получает дату для трат со скриншота"""
+    text = update.message.text.strip().lower()
+    
+    if text == "сегодня":
+        date_str = datetime.now().strftime("%Y-%m-%d")
+    else:
+        try:
+            # Пробуем разные форматы
+            for fmt in ("%d.%m.%Y", "%d.%m.%y", "%Y-%m-%d"):
+                try:
+                    dt = datetime.strptime(text, fmt)
+                    date_str = dt.strftime("%Y-%m-%d")
+                    break
+                except ValueError:
+                    continue
+            else:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text("❌ Неверный формат. Введи ДД.ММ.YYYY или 'сегодня':")
+            return WAITING_SCREENSHOT_DATE
+    
+    context.user_data["screenshot_date"] = date_str
+    expenses = context.user_data["screenshot_expenses"]
+    
+    # Показываем итоговый список с категориями
+    msg = f"📅 *Дата:* {date_str}\n\n*Траты:*\n"
+    for desc, amount in expenses:
+        cat = guess_category(desc)
+        msg += f"• {desc} — {amount:.0f} ₽ ({cat})\n"
+    
+    msg += f"\n*Итого:* {sum(e[1] for e in expenses):.0f} ₽"
+    
+    keyboard = [
+        [InlineKeyboardButton("✅ Сохранить все", callback_data="ss_save_all")],
+        [InlineKeyboardButton("📝 Изменить категории", callback_data="ss_edit_cats")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="ss_cancel")],
+    ]
+    
+    await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+    return WAITING_SCREENSHOT_CONFIRM
+
+async def screenshot_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает подтверждение скриншота"""
+    query = update.callback_query
+    await query.answer()
+    action = query.data
+    
+    if action == "ss_cancel":
+        await query.edit_message_text("❌ Отменено.")
+        context.user_data.pop("screenshot_expenses", None)
+        return ConversationHandler.END
+    
+    if action == "ss_save_all":
+        expenses = context.user_data.get("screenshot_expenses", [])
+        date_str = context.user_data.get("screenshot_date", datetime.now().isoformat())
+        uid = query.from_user.id
+        
+        for desc, amount in expenses:
+            cat = guess_category(desc)
+            add_expense(uid, amount, cat, desc, date_str)
+        
+        total = sum(e[1] for e in expenses)
+        await query.edit_message_text(
+            f"✅ Сохранено *{len(expenses)}* трат на сумму *{total:.0f} ₽*",
+            parse_mode="Markdown"
+        )
+        context.user_data.pop("screenshot_expenses", None)
+        return ConversationHandler.END
+    
+    if action == "ss_edit_cats":
+        # Показываем кнопки для изменения категорий по очереди
+        expenses = context.user_data.get("screenshot_expenses", [])
+        if not expenses:
+            await query.edit_message_text("❌ Ошибка.")
+            return ConversationHandler.END
+        
+        # Начинаем с первой траты
+        context.user_data["ss_edit_index"] = 0
+        return await show_category_selector(query, context)
+
+async def show_category_selector(query, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает выбор категории для текущей траты"""
+    idx = context.user_data.get("ss_edit_index", 0)
+    expenses = context.user_data.get("screenshot_expenses", [])
+    
+    if idx >= len(expenses):
+        # Все категории выбраны, сохраняем
+        return await save_all_after_edit(query, context)
+    
+    desc, amount = expenses[idx]
+    current_cat = guess_category(desc)
+    
+    keyboard = []
+    for i in range(0, len(DEFAULT_CATEGORIES), 2):
+        row = []
+        for cat in DEFAULT_CATEGORIES[i:i+2]:
+            prefix = "✅ " if cat == current_cat else ""
+            row.append(InlineKeyboardButton(f"{prefix}{cat}", callback_data=f"sscat_{cat}"))
+        keyboard.append(row)
+    
+    await query.edit_message_text(
+        f"📝 Трата {idx+1}/{len(expenses)}:\n*{desc}* — {amount:.0f} ₽\n\nВыбери категорию:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
     )
 
+async def screenshot_category_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает выбор категории для траты со скриншота"""
+    query = update.callback_query
+    await query.answer()
+    category = query.data.replace("sscat_", "")
+    
+    idx = context.user_data.get("ss_edit_index", 0)
+    expenses = context.user_data.get("screenshot_expenses", [])
+    
+    if idx < len(expenses):
+        # Заменяем категорию (сохраняем в отдельном списке)
+        if "ss_categories" not in context.user_data:
+            context.user_data["ss_categories"] = []
+        
+        # Дополняем список категорий до текущего индекса
+        while len(context.user_data["ss_categories"]) <= idx:
+            desc, amount = expenses[len(context.user_data["ss_categories"])]
+            context.user_data["ss_categories"].append(guess_category(desc))
+        
+        context.user_data["ss_categories"][idx] = category
+        context.user_data["ss_edit_index"] = idx + 1
+        
+        return await show_category_selector(query, context)
+    
+    return ConversationHandler.END
+
+async def save_all_after_edit(query, context: ContextTypes.DEFAULT_TYPE):
+    """Сохраняет все траты после ручного выбора категорий"""
+    expenses = context.user_data.get("screenshot_expenses", [])
+    categories = context.user_data.get("ss_categories", [])
+    date_str = context.user_data.get("screenshot_date", datetime.now().isoformat())
+    uid = query.from_user.id
+    
+    for i, (desc, amount) in enumerate(expenses):
+        cat = categories[i] if i < len(categories) else guess_category(desc)
+        add_expense(uid, amount, cat, desc, date_str)
+    
+    total = sum(e[1] for e in expenses)
+    await query.edit_message_text(
+        f"✅ Сохранено *{len(expenses)}* трат на сумму *{total:.0f} ₽*",
+        parse_mode="Markdown"
+    )
+    
+    # Чистим
+    for key in ["screenshot_expenses", "screenshot_date", "screenshot_text", "ss_categories", "ss_edit_index"]:
+        context.user_data.pop(key, None)
+    
+    return ConversationHandler.END
+
+# ==================== MANUAL ADD ====================
 async def add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Введи сумму (250.50):")
     return WAITING_AMOUNT
@@ -218,6 +454,18 @@ async def add_category_callback(update: Update, context: ContextTypes.DEFAULT_TY
     add_expense(query.from_user.id, amount, category)
     await query.edit_message_text(f"✅ Добавлено: *{amount:.2f} ₽* — {category}", parse_mode="Markdown")
     return ConversationHandler.END
+
+# ==================== REPORTS ====================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "👋 Бот учёта трат!\n\n"
+        "📸 Отправь скриншот со списком трат за день\n"
+        "✏️ /add — добавить вручную\n"
+        "📊 /week /month /categories — отчёты\n"
+        "📝 /list — редактировать или удалить\n"
+        "📤 /export — бэкап CSV\n\n"
+        "Категории: " + ", ".join(DEFAULT_CATEGORIES)
+    )
 
 async def week_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.message.from_user.id
@@ -333,18 +581,6 @@ async def edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"✅ Категория: {val}")
     return ConversationHandler.END
 
-async def ocr_category_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if query.data == "ocr_cancel":
-        await query.edit_message_text("❌ Отменено.")
-        return
-    category = query.data.replace("ocr_cat_", "")
-    amount = context.user_data.get("ocr_amount", 0)
-    desc = context.user_data.get("ocr_description", "")
-    add_expense(query.from_user.id, amount, category, desc)
-    await query.edit_message_text(f"✅ Сохранено: *{amount:.2f} ₽* — {category}\n_(со скриншота)_", parse_mode="Markdown")
-
 # ==================== WEB SERVER ====================
 async def health(request):
     return web.Response(text="Bot OK")
@@ -363,7 +599,7 @@ async def webhook(request):
 async def on_startup(app):
     await app['ptb_app'].initialize()
     await app['ptb_app'].start()
-    host = os.environ.get("RENDER_EXTERNAL_HOSTNAME") or os.environ.get("RAILWAY_PUBLIC_DOMAIN")
+    host = os.environ.get("RAILWAY_PUBLIC_DOMAIN") or os.environ.get("RENDER_EXTERNAL_HOSTNAME")
     if host:
         url = f"https://{host}/webhook"
         await app['ptb_app'].bot.set_webhook(url)
@@ -383,6 +619,7 @@ def main():
     ptb_app.add_handler(CommandHandler("categories", categories_report))
     ptb_app.add_handler(CommandHandler("export", export_csv))
 
+    # Ручное добавление
     ptb_app.add_handler(ConversationHandler(
         entry_points=[CommandHandler("add", add_start)],
         states={
@@ -390,8 +627,10 @@ def main():
             WAITING_CATEGORY: [CallbackQueryHandler(add_category_callback, pattern=r"^addcat_")],
         },
         fallbacks=[CommandHandler("cancel", lambda u, c: u.message.reply_text("Отменено."))],
+        per_message=True,
     ))
 
+    # Редактирование
     ptb_app.add_handler(ConversationHandler(
         entry_points=[CommandHandler("list", list_expenses)],
         states={
@@ -403,10 +642,20 @@ def main():
             WAITING_EDIT_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_value)],
         },
         fallbacks=[CommandHandler("cancel", lambda u, c: u.message.reply_text("Отменено."))],
+        per_message=True,
     ))
 
-    ptb_app.add_handler(CallbackQueryHandler(ocr_category_callback, pattern=r"^ocr_"))
-    ptb_app.add_handler(MessageHandler(filters.PHOTO, process_photo))
+    # Скриншот (не ConversationHandler — чтобы не конфликтовал с другими)
+    ptb_app.add_handler(MessageHandler(filters.PHOTO, process_screenshot))
+    ptb_app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND,
+        screenshot_date,
+        block=False,
+    ))
+    
+    # Callback для скриншота (вне ConversationHandler)
+    ptb_app.add_handler(CallbackQueryHandler(screenshot_confirm_callback, pattern=r"^ss_"))
+    ptb_app.add_handler(CallbackQueryHandler(screenshot_category_callback, pattern=r"^sscat_"))
 
     aio_app = web.Application()
     aio_app['ptb_app'] = ptb_app
