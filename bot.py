@@ -31,8 +31,7 @@ DB_PATH = "expenses.db"
 
 # Состояния
 WAITING_AMOUNT, WAITING_CATEGORY, WAITING_NEW_CATEGORY, \
-WAITING_EDIT_SELECT, WAITING_EDIT_FIELD, WAITING_EDIT_VALUE, \
-WAITING_DELETE_SELECT = range(7)
+WAITING_EDIT_SELECT, WAITING_EDIT_FIELD, WAITING_EDIT_VALUE = range(6)
 
 STATE_IDLE = "idle"
 STATE_SCREENSHOT_DATE = "screenshot_date"
@@ -72,7 +71,6 @@ def init_db():
     conn.close()
 
 def get_user_categories(user_id: int) -> List[str]:
-    """Возвращает категории пользователя + дефолтные"""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("SELECT category FROM user_categories WHERE user_id = ?", (user_id,))
@@ -81,7 +79,6 @@ def get_user_categories(user_id: int) -> List[str]:
     
     default = ["Продукты", "Транспорт", "Кафе", "Развлечения",
                "Здоровье", "Одежда", "Коммунальные", "Другое"]
-    # Убираем дубликаты, сохраняя порядок
     seen = set()
     result = []
     for cat in custom + default:
@@ -233,7 +230,6 @@ def parse_bank_screenshot(text: str) -> Tuple[Optional[str], List[Tuple[str, flo
     }
     
     def extract_amount(s: str) -> Optional[float]:
-        # Проверяем, что это не пополнение (плюс в начале)
         if re.match(r'^\s*\+', s):
             return None
         
@@ -265,7 +261,6 @@ def parse_bank_screenshot(text: str) -> Tuple[Optional[str], List[Tuple[str, flo
         return any(sw in line_lower for sw in service_words) or line in ["+1", "+2", "+3", ")", "("]
     
     def is_income(line: str) -> bool:
-        """Проверяет, является ли строка доходом/пополнением"""
         income_markers = ["зачисление", "пополнение", "возврат", "кэшбэк", "доход", "зарплата", "перевод от"]
         line_lower = line.lower()
         return any(m in line_lower for m in income_markers) or re.match(r'^\s*\+', line)
@@ -273,12 +268,10 @@ def parse_bank_screenshot(text: str) -> Tuple[Optional[str], List[Tuple[str, flo
     while i < len(lines):
         line = lines[i]
         
-        # Пропускаем доходы
         if is_income(line):
             i += 1
             continue
         
-        # Ищем дату
         found_date = False
         for pattern, ptype in date_patterns:
             m = re.match(pattern, line, re.IGNORECASE)
@@ -305,11 +298,9 @@ def parse_bank_screenshot(text: str) -> Tuple[Optional[str], List[Tuple[str, flo
             i += 1
             continue
         
-        # Ищем трату
         if not is_service_line(line) and not is_income(line) and i + 1 < len(lines):
             next_line = lines[i + 1]
             
-            # Проверяем, что следующая строка не доход
             if is_income(next_line):
                 i += 2
                 continue
@@ -389,8 +380,8 @@ async def process_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE)
     context.user_data["parsed_date"] = parsed_date
     context.user_data["state"] = STATE_SCREENSHOT_DATE
     
-    date_str = parsed_date or "не определена"
-    msg = f"📅 *Дата:* {date_str}\n\n📸 *Распознано трат: {len(expenses)}*\n\n"
+    # Показываем распознанные траты
+    msg = f"📸 *Распознано трат: {len(expenses)}*\n\n"
     for i, (desc, amount) in enumerate(expenses, 1):
         cat = guess_category(desc, get_user_categories(user_id))
         msg += f"{i}. {desc} — *{amount:.2f} ₽* ({cat})\n"
@@ -398,14 +389,59 @@ async def process_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE)
     total = sum(e[1] for e in expenses)
     msg += f"\n💰 *Итого:* {total:.2f} ₽"
     
-    if parsed_date:
-        msg += f"\n\nВведи дату (ДД.ММ.YYYY), 'сегодня', 'вчера' или '{parsed_date}':"
-    else:
-        msg += "\n\nВведи дату (ДД.ММ.YYYY), 'сегодня' или 'вчера':"
+    # Кнопки выбора даты
+    today = datetime.now()
+    yesterday = today - timedelta(days=1)
+    day_before = today - timedelta(days=2)
     
-    await update.message.reply_text(msg, parse_mode="Markdown")
+    date_buttons = [
+        InlineKeyboardButton("📅 Сегодня", callback_data=f"ssdate_{today.strftime('%Y-%m-%d')}"),
+        InlineKeyboardButton("📅 Вчера", callback_data=f"ssdate_{yesterday.strftime('%Y-%m-%d')}"),
+        InlineKeyboardButton(f"📅 {day_before.strftime('%d.%m')}", callback_data=f"ssdate_{day_before.strftime('%Y-%m-%d')}"),
+    ]
+    
+    # Если распознана дата — добавляем её кнопкой
+    if parsed_date:
+        try:
+            dt = datetime.strptime(parsed_date, "%Y-%m-%d")
+            date_str = dt.strftime("%d.%m")
+            # Проверяем, нет ли уже такой даты
+            existing = [today, yesterday, day_before]
+            if not any(d.strftime("%Y-%m-%d") == parsed_date for d in existing):
+                date_buttons.insert(0, InlineKeyboardButton(f"📅 {date_str} (со скриншота)", callback_data=f"ssdate_{parsed_date}"))
+        except:
+            pass
+    
+    keyboard = [date_buttons]
+    keyboard.append([InlineKeyboardButton("✏️ Ввести дату вручную", callback_data="ssdate_manual")])
+    keyboard.append([InlineKeyboardButton("❌ Отмена", callback_data="ss_cancel")])
+    
+    await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+async def screenshot_date_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает выбор даты кнопкой"""
+    query = update.callback_query
+    await query.answer()
+    action = query.data
+    
+    if action == "ss_cancel":
+        await query.edit_message_text("❌ Отменено.")
+        clear_screenshot_data(context)
+        return
+    
+    if action == "ssdate_manual":
+        await query.edit_message_text("Введи дату в формате ДД.ММ.YYYY:")
+        context.user_data["state"] = STATE_SCREENSHOT_DATE
+        return
+    
+    # Извлекаем дату из callback_data
+    date_str = action.replace("ssdate_", "")
+    context.user_data["screenshot_date"] = date_str
+    
+    await show_confirm_screen(query, context)
 
 async def handle_screenshot_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает ввод даты вручную"""
     user_id = update.message.from_user.id
     state = context.user_data.get("state")
     
@@ -434,7 +470,16 @@ async def handle_screenshot_date(update: Update, context: ContextTypes.DEFAULT_T
             return
     
     context.user_data["screenshot_date"] = date_str
-    expenses = context.user_data["screenshot_expenses"]
+    context.user_data["state"] = STATE_SCREENSHOT_CONFIRM
+    
+    # Показываем итоговый экран с кнопками действий
+    await show_confirm_message(update, context)
+
+async def show_confirm_screen(query, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает экран подтверждения после выбора даты"""
+    expenses = context.user_data.get("screenshot_expenses", [])
+    date_str = context.user_data.get("screenshot_date", "не указана")
+    user_id = query.from_user.id
     
     msg = f"📅 *Дата:* {date_str}\n\n*Траты:*\n"
     for i, (desc, amount) in enumerate(expenses, 1):
@@ -448,11 +493,35 @@ async def handle_screenshot_date(update: Update, context: ContextTypes.DEFAULT_T
         [InlineKeyboardButton("✅ Сохранить все", callback_data="ss_save_all")],
         [InlineKeyboardButton("📝 Изменить категории", callback_data="ss_edit_cats")],
         [InlineKeyboardButton("🗑 Удалить траты", callback_data="ss_delete")],
+        [InlineKeyboardButton("📅 Изменить дату", callback_data="ss_change_date")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="ss_cancel")],
+    ]
+    
+    await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+async def show_confirm_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает экран подтверждения (для текстового ввода даты)"""
+    expenses = context.user_data.get("screenshot_expenses", [])
+    date_str = context.user_data.get("screenshot_date", "не указана")
+    user_id = update.message.from_user.id
+    
+    msg = f"📅 *Дата:* {date_str}\n\n*Траты:*\n"
+    for i, (desc, amount) in enumerate(expenses, 1):
+        cat = guess_category(desc, get_user_categories(user_id))
+        msg += f"{i}. {desc} — {amount:.2f} ₽ ({cat})\n"
+    
+    total = sum(e[1] for e in expenses)
+    msg += f"\n💰 *Итого:* {total:.2f} ₽"
+    
+    keyboard = [
+        [InlineKeyboardButton("✅ Сохранить все", callback_data="ss_save_all")],
+        [InlineKeyboardButton("📝 Изменить категории", callback_data="ss_edit_cats")],
+        [InlineKeyboardButton("🗑 Удалить траты", callback_data="ss_delete")],
+        [InlineKeyboardButton("📅 Изменить дату", callback_data="ss_change_date")],
         [InlineKeyboardButton("❌ Отмена", callback_data="ss_cancel")],
     ]
     
     await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
-    context.user_data["state"] = STATE_SCREENSHOT_CONFIRM
 
 async def screenshot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -462,6 +531,30 @@ async def screenshot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     if action == "ss_cancel":
         await query.edit_message_text("❌ Отменено.")
         clear_screenshot_data(context)
+        return
+    
+    if action == "ss_change_date":
+        # Возвращаемся к выбору даты
+        today = datetime.now()
+        yesterday = today - timedelta(days=1)
+        day_before = today - timedelta(days=2)
+        
+        keyboard = [
+            [
+                InlineKeyboardButton("📅 Сегодня", callback_data=f"ssdate_{today.strftime('%Y-%m-%d')}"),
+                InlineKeyboardButton("📅 Вчера", callback_data=f"ssdate_{yesterday.strftime('%Y-%m-%d')}"),
+                InlineKeyboardButton(f"📅 {day_before.strftime('%d.%m')}", callback_data=f"ssdate_{day_before.strftime('%Y-%m-%d')}"),
+            ],
+            [InlineKeyboardButton("✏️ Ввести дату вручную", callback_data="ssdate_manual")],
+            [InlineKeyboardButton("❌ Отмена", callback_data="ss_cancel")],
+        ]
+        
+        await query.edit_message_text(
+            "📅 *Выбери дату:*",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
+        )
+        context.user_data["state"] = STATE_SCREENSHOT_DATE
         return
     
     if action == "ss_save_all":
@@ -504,7 +597,6 @@ async def screenshot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         await show_delete_selector(query, context)
 
 async def show_delete_selector(query, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает список трат для удаления"""
     expenses = context.user_data.get("screenshot_expenses", [])
     
     keyboard = []
@@ -521,7 +613,6 @@ async def show_delete_selector(query, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def screenshot_delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает удаление трат"""
     query = update.callback_query
     await query.answer()
     action = query.data
@@ -532,37 +623,20 @@ async def screenshot_delete_callback(update: Update, context: ContextTypes.DEFAU
         return
     
     if action == "ssdel_done":
-        # Показываем итоговый список
         expenses = context.user_data.get("screenshot_expenses", [])
         if not expenses:
             await query.edit_message_text("❌ Все траты удалены.")
             clear_screenshot_data(context)
             return
         
-        deleted = context.user_data.get("ss_deleted", [])
+        deleted = context.user_data.get("ss_deleted", set())
         remaining = [(d, a) for i, (d, a) in enumerate(expenses) if i not in deleted]
         context.user_data["screenshot_expenses"] = remaining
         
-        msg = f"📅 *Дата:* {context.user_data.get('screenshot_date', 'не указана')}\n\n*Оставшиеся траты:*\n"
-        for i, (desc, amount) in enumerate(remaining, 1):
-            cat = guess_category(desc, get_user_categories(query.from_user.id))
-            msg += f"{i}. {desc} — {amount:.2f} ₽ ({cat})\n"
-        
-        total = sum(e[1] for e in remaining)
-        msg += f"\n💰 *Итого:* {total:.2f} ₽"
-        
-        keyboard = [
-            [InlineKeyboardButton("✅ Сохранить", callback_data="ss_save_all")],
-            [InlineKeyboardButton("📝 Категории", callback_data="ss_edit_cats")],
-            [InlineKeyboardButton("🗑 Удалить ещё", callback_data="ss_delete")],
-            [InlineKeyboardButton("❌ Отмена", callback_data="ss_cancel")],
-        ]
-        
-        await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
-        context.user_data["state"] = STATE_SCREENSHOT_CONFIRM
+        # Показываем итоговый экран с оставшимися тратами
+        await show_confirm_screen(query, context)
         return
     
-    # Удаление/восстановление конкретной траты
     idx = int(action.replace("ssdel_", ""))
     deleted = context.user_data.setdefault("ss_deleted", set())
     
@@ -573,7 +647,6 @@ async def screenshot_delete_callback(update: Update, context: ContextTypes.DEFAU
         deleted.add(idx)
         await query.answer(f"Трата {idx+1} отмечена для удаления")
     
-    # Обновляем кнопки
     await show_delete_selector(query, context)
 
 async def screenshot_category_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -916,6 +989,7 @@ def main():
     ptb_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_screenshot_date))
     
     # Callback для скриншота
+    ptb_app.add_handler(CallbackQueryHandler(screenshot_date_callback, pattern=r"^ssdate_"))
     ptb_app.add_handler(CallbackQueryHandler(screenshot_callback, pattern=r"^ss_"))
     ptb_app.add_handler(CallbackQueryHandler(screenshot_category_callback, pattern=r"^sscat_"))
     ptb_app.add_handler(CallbackQueryHandler(screenshot_delete_callback, pattern=r"^ssdel_"))
