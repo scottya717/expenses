@@ -1,6 +1,5 @@
 import os
 import re
-import sqlite3
 import csv
 import base64
 import logging
@@ -9,6 +8,7 @@ from typing import Optional, List, Tuple
 from io import BytesIO
 
 import aiohttp
+import psycopg2
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -26,8 +26,7 @@ from PIL import Image
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 YANDEX_API_KEY = os.environ.get("YANDEX_API_KEY")
 YANDEX_FOLDER_ID = os.environ.get("YANDEX_FOLDER_ID")
-
-DB_PATH = "expenses.db"
+DATABASE_URL = os.environ.get("DATABASE_URL")
 
 # Состояния
 WAITING_AMOUNT, WAITING_CATEGORY, WAITING_NEW_CATEGORY, \
@@ -46,23 +45,27 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ==================== DB ====================
+def get_conn():
+    """Создаёт подключение к PostgreSQL"""
+    return psycopg2.connect(DATABASE_URL, sslmode='require')
+
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
     c.execute("""
         CREATE TABLE IF NOT EXISTS expenses (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT NOT NULL,
             amount REAL NOT NULL,
             category TEXT NOT NULL,
             description TEXT,
-            date TEXT NOT NULL,
+            date TIMESTAMP NOT NULL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
     c.execute("""
         CREATE TABLE IF NOT EXISTS user_categories (
-            user_id INTEGER NOT NULL,
+            user_id BIGINT NOT NULL,
             category TEXT NOT NULL,
             PRIMARY KEY (user_id, category)
         )
@@ -71,9 +74,9 @@ def init_db():
     conn.close()
 
 def get_user_categories(user_id: int) -> List[str]:
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
-    c.execute("SELECT category FROM user_categories WHERE user_id = ?", (user_id,))
+    c.execute("SELECT category FROM user_categories WHERE user_id = %s", (user_id,))
     custom = [r[0] for r in c.fetchall()]
     conn.close()
     
@@ -88,35 +91,35 @@ def get_user_categories(user_id: int) -> List[str]:
     return result
 
 def add_user_category(user_id: int, category: str):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
-    c.execute("INSERT OR IGNORE INTO user_categories (user_id, category) VALUES (?, ?)", (user_id, category))
+    c.execute("INSERT INTO user_categories (user_id, category) VALUES (%s, %s) ON CONFLICT DO NOTHING", (user_id, category))
     conn.commit()
     conn.close()
 
 def add_expense(user_id: int, amount: float, category: str, description: str = "", date: Optional[str] = None):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
     d = date or datetime.now().isoformat()
     c.execute(
-        "INSERT INTO expenses (user_id, amount, category, description, date) VALUES (?, ?, ?, ?, ?)",
+        "INSERT INTO expenses (user_id, amount, category, description, date) VALUES (%s, %s, %s, %s, %s)",
         (user_id, amount, category, description, d),
     )
     conn.commit()
     conn.close()
 
 def get_expenses(user_id: int, days: Optional[int] = None):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
     if days:
         since = (datetime.now() - timedelta(days=days)).isoformat()
         c.execute(
-            "SELECT id, amount, category, description, date FROM expenses WHERE user_id = ? AND date > ? ORDER BY date DESC",
+            "SELECT id, amount, category, description, date FROM expenses WHERE user_id = %s AND date > %s ORDER BY date DESC",
             (user_id, since),
         )
     else:
         c.execute(
-            "SELECT id, amount, category, description, date FROM expenses WHERE user_id = ? ORDER BY date DESC",
+            "SELECT id, amount, category, description, date FROM expenses WHERE user_id = %s ORDER BY date DESC",
             (user_id,),
         )
     rows = c.fetchall()
@@ -124,10 +127,10 @@ def get_expenses(user_id: int, days: Optional[int] = None):
     return rows
 
 def get_expense_by_id(expense_id: int, user_id: int):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
     c.execute(
-        "SELECT id, amount, category, description, date FROM expenses WHERE id = ? AND user_id = ?",
+        "SELECT id, amount, category, description, date FROM expenses WHERE id = %s AND user_id = %s",
         (expense_id, user_id),
     )
     row = c.fetchone()
@@ -135,31 +138,31 @@ def get_expense_by_id(expense_id: int, user_id: int):
     return row
 
 def update_expense(expense_id: int, user_id: int, field: str, value):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
     c.execute(
-        f"UPDATE expenses SET {field} = ? WHERE id = ? AND user_id = ?",
+        f"UPDATE expenses SET {field} = %s WHERE id = %s AND user_id = %s",
         (value, expense_id, user_id),
     )
     conn.commit()
     conn.close()
 
 def delete_expense(expense_id: int, user_id: int):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
-    c.execute("DELETE FROM expenses WHERE id = ? AND user_id = ?", (expense_id, user_id))
+    c.execute("DELETE FROM expenses WHERE id = %s AND user_id = %s", (expense_id, user_id))
     conn.commit()
     conn.close()
 
 def get_summary_by_category(user_id: int, days: int):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
     since = (datetime.now() - timedelta(days=days)).isoformat()
     c.execute(
         """
         SELECT category, SUM(amount), COUNT(*) 
         FROM expenses 
-        WHERE user_id = ? AND date > ? 
+        WHERE user_id = %s AND date > %s 
         GROUP BY category 
         ORDER BY SUM(amount) DESC
         """,
@@ -380,7 +383,6 @@ async def process_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE)
     context.user_data["parsed_date"] = parsed_date
     context.user_data["state"] = STATE_SCREENSHOT_DATE
     
-    # Показываем распознанные траты
     msg = f"📸 *Распознано трат: {len(expenses)}*\n\n"
     for i, (desc, amount) in enumerate(expenses, 1):
         cat = guess_category(desc, get_user_categories(user_id))
@@ -389,7 +391,6 @@ async def process_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE)
     total = sum(e[1] for e in expenses)
     msg += f"\n💰 *Итого:* {total:.2f} ₽"
     
-    # Кнопки выбора даты
     today = datetime.now()
     yesterday = today - timedelta(days=1)
     day_before = today - timedelta(days=2)
@@ -400,12 +401,10 @@ async def process_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE)
         InlineKeyboardButton(f"📅 {day_before.strftime('%d.%m')}", callback_data=f"ssdate_{day_before.strftime('%Y-%m-%d')}"),
     ]
     
-    # Если распознана дата — добавляем её кнопкой
     if parsed_date:
         try:
             dt = datetime.strptime(parsed_date, "%Y-%m-%d")
             date_str = dt.strftime("%d.%m")
-            # Проверяем, нет ли уже такой даты
             existing = [today, yesterday, day_before]
             if not any(d.strftime("%Y-%m-%d") == parsed_date for d in existing):
                 date_buttons.insert(0, InlineKeyboardButton(f"📅 {date_str} (со скриншота)", callback_data=f"ssdate_{parsed_date}"))
@@ -419,7 +418,6 @@ async def process_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
 async def screenshot_date_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает выбор даты кнопкой"""
     query = update.callback_query
     await query.answer()
     action = query.data
@@ -434,14 +432,12 @@ async def screenshot_date_callback(update: Update, context: ContextTypes.DEFAULT
         context.user_data["state"] = STATE_SCREENSHOT_DATE
         return
     
-    # Извлекаем дату из callback_data
     date_str = action.replace("ssdate_", "")
     context.user_data["screenshot_date"] = date_str
     
     await show_confirm_screen(query, context)
 
 async def handle_screenshot_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает ввод даты вручную"""
     user_id = update.message.from_user.id
     state = context.user_data.get("state")
     
@@ -472,11 +468,9 @@ async def handle_screenshot_date(update: Update, context: ContextTypes.DEFAULT_T
     context.user_data["screenshot_date"] = date_str
     context.user_data["state"] = STATE_SCREENSHOT_CONFIRM
     
-    # Показываем итоговый экран с кнопками действий
     await show_confirm_message(update, context)
 
 async def show_confirm_screen(query, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает экран подтверждения после выбора даты"""
     expenses = context.user_data.get("screenshot_expenses", [])
     date_str = context.user_data.get("screenshot_date", "не указана")
     user_id = query.from_user.id
@@ -500,7 +494,6 @@ async def show_confirm_screen(query, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
 async def show_confirm_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает экран подтверждения (для текстового ввода даты)"""
     expenses = context.user_data.get("screenshot_expenses", [])
     date_str = context.user_data.get("screenshot_date", "не указана")
     user_id = update.message.from_user.id
@@ -534,7 +527,6 @@ async def screenshot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     
     if action == "ss_change_date":
-        # Возвращаемся к выбору даты
         today = datetime.now()
         yesterday = today - timedelta(days=1)
         day_before = today - timedelta(days=2)
@@ -633,7 +625,6 @@ async def screenshot_delete_callback(update: Update, context: ContextTypes.DEFAU
         remaining = [(d, a) for i, (d, a) in enumerate(expenses) if i not in deleted]
         context.user_data["screenshot_expenses"] = remaining
         
-        # Показываем итоговый экран с оставшимися тратами
         await show_confirm_screen(query, context)
         return
     
@@ -951,7 +942,6 @@ def main():
     ptb_app.add_handler(CommandHandler("export", export_csv))
     ptb_app.add_handler(CommandHandler("cancel", cancel_cmd))
 
-    # Кастомные категории
     ptb_app.add_handler(ConversationHandler(
         entry_points=[CommandHandler("setcategory", setcategory_start)],
         states={
@@ -960,7 +950,6 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel_cmd)],
     ))
 
-    # Ручное добавление
     ptb_app.add_handler(ConversationHandler(
         entry_points=[CommandHandler("add", add_start)],
         states={
@@ -970,7 +959,6 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel_cmd)],
     ))
 
-    # Редактирование
     ptb_app.add_handler(ConversationHandler(
         entry_points=[CommandHandler("list", list_expenses)],
         states={
@@ -984,11 +972,9 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel_cmd)],
     ))
 
-    # Скриншот
     ptb_app.add_handler(MessageHandler(filters.PHOTO, process_screenshot))
     ptb_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_screenshot_date))
     
-    # Callback для скриншота
     ptb_app.add_handler(CallbackQueryHandler(screenshot_date_callback, pattern=r"^ssdate_"))
     ptb_app.add_handler(CallbackQueryHandler(screenshot_callback, pattern=r"^ss_"))
     ptb_app.add_handler(CallbackQueryHandler(screenshot_category_callback, pattern=r"^sscat_"))
