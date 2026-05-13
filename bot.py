@@ -33,9 +33,14 @@ DEFAULT_CATEGORIES = [
     "Здоровье", "Одежда", "Коммунальные", "Другое"
 ]
 
-WAITING_AMOUNT, WAITING_CATEGORY, WAITING_DATE, \
-WAITING_EDIT_SELECT, WAITING_EDIT_FIELD, WAITING_EDIT_VALUE, \
-WAITING_SCREENSHOT_DATE, WAITING_SCREENSHOT_CONFIRM = range(8)
+# Состояния для ConversationHandler (только ручное добавление и редактирование)
+WAITING_AMOUNT, WAITING_CATEGORY, WAITING_EDIT_SELECT, WAITING_EDIT_FIELD, WAITING_EDIT_VALUE = range(5)
+
+# Состояния для скриншота (через user_data, не ConversationHandler)
+STATE_IDLE = "idle"
+STATE_SCREENSHOT_DATE = "screenshot_date"
+STATE_SCREENSHOT_CONFIRM = "screenshot_confirm"
+STATE_SCREENSHOT_EDIT_CAT = "screenshot_edit_cat"
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -139,6 +144,7 @@ def get_summary_by_category(user_id: int, days: int):
 # ==================== YANDEX OCR ====================
 async def yandex_ocr(image_bytes: bytes) -> str:
     if not YANDEX_API_KEY or not YANDEX_FOLDER_ID:
+        logger.error("YANDEX_API_KEY or YANDEX_FOLDER_ID not set")
         return ""
     
     encoded = base64.b64encode(image_bytes).decode("utf-8")
@@ -150,42 +156,44 @@ async def yandex_ocr(image_bytes: bytes) -> str:
         }]
     }
     
-    async with aiohttp.ClientSession() as session:
-        async with session.post(
-            "https://vision.api.cloud.yandex.net/vision/v1/batchAnalyze",
-            headers={"Authorization": f"Api-Key {YANDEX_API_KEY}", "Content-Type": "application/json"},
-            json=body,
-            timeout=aiohttp.ClientTimeout(total=30)
-        ) as resp:
-            if resp.status != 200:
-                logger.error(f"Yandex OCR error: {resp.status}")
-                return ""
-            data = await resp.json()
-            texts = []
-            for result in data.get("results", []):
-                for page in result.get("results", []):
-                    for block in page.get("textDetection", {}).get("pages", [{}])[0].get("blocks", []):
-                        for line in block.get("lines", []):
-                            line_text = " ".join(w.get("text", "") for w in line.get("words", []))
-                            texts.append(line_text)
-            return "\n".join(texts)
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                "https://vision.api.cloud.yandex.net/vision/v1/batchAnalyze",
+                headers={"Authorization": f"Api-Key {YANDEX_API_KEY}", "Content-Type": "application/json"},
+                json=body,
+                timeout=aiohttp.ClientTimeout(total=30)
+            ) as resp:
+                if resp.status != 200:
+                    text = await resp.text()
+                    logger.error(f"Yandex OCR error: {resp.status} - {text}")
+                    return ""
+                data = await resp.json()
+                texts = []
+                for result in data.get("results", []):
+                    for page in result.get("results", []):
+                        text_data = page.get("textDetection", {})
+                        for p in text_data.get("pages", [{}]):
+                            for block in p.get("blocks", []):
+                                for line in block.get("lines", []):
+                                    line_text = " ".join(w.get("text", "") for w in line.get("words", []))
+                                    texts.append(line_text)
+                return "\n".join(texts)
+    except Exception as e:
+        logger.error(f"Yandex OCR exception: {e}")
+        return ""
 
 # ==================== PARSER для банковских скриншотов ====================
 def parse_bank_screenshot(text: str) -> Tuple[Optional[str], List[Tuple[str, float]]]:
-    """
-    Парсит скриншот банковского приложения.
-    Возвращает: (дата, [(описание, сумма), ...])
-    """
     lines = [l.strip() for l in text.split("\n") if l.strip()]
     expenses = []
     current_date = None
     i = 0
     
-    # Паттерны дат
     date_patterns = [
-        r'(\d{1,2})\s+(января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)',
-        r'(\d{1,2})\.(\d{1,2})\.(\d{2,4})',
-        r'(\d{1,2})/(\d{1,2})/(\d{2,4})',
+        (r'(\d{1,2})\s+(января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)', 'ru'),
+        (r'(\d{1,2})\.(\d{1,2})\.(\d{2,4})', 'num'),
+        (r'(\d{1,2})/(\d{1,2})/(\d{2,4})', 'num'),
     ]
     
     months_ru = {
@@ -194,48 +202,47 @@ def parse_bank_screenshot(text: str) -> Tuple[Optional[str], List[Tuple[str, flo
     }
     
     def extract_amount(s: str) -> Optional[float]:
-        """Извлекает сумму из строки (с минусом или без)"""
-        # Ищем число с пробелами/запятыми, возможно с минусом
         patterns = [
-            r'[-–]?\s*([\d\s]+[.,]\d{2})\s*[₽PР]',  # -1 766,00 ₽ или 182,98 ₽
-            r'[-–]?\s*([\d\s]+)\s*[₽PР]',           # -200 ₽ или -1 766 ₽
-            r'[-–]?\s*([\d\s]+[.,]\d{2})',           # просто число с копейками
-            r'[-–]?\s*([\d\s]{3,})',                 # крупное число с пробелами
+            r'[-–]?\s*([\d\s]+[.,]\d{2})\s*[₽PРp]',
+            r'[-–]?\s*([\d\s]+)\s*[₽PРp]',
+            r'[-–]?\s*([\d\s]+[.,]\d{2})',
+            r'[-–]?\s*([\d\s]{3,})',
         ]
         for p in patterns:
             m = re.search(p, s)
             if m:
                 try:
                     val = m.group(1).replace(" ", "").replace(",", ".")
-                    return abs(float(val))  # всегда положительная сумма
+                    return abs(float(val))
                 except ValueError:
                     continue
         return None
     
     def is_service_line(line: str) -> bool:
-        """Проверяет, является ли строка служебной (не описанием траты)"""
         service_words = [
             "переводы", "двойной чёрный", "дебетовая карта", "супермаркеты",
             "местный транспорт", "перевод", "зачисление", "доходы", "траты",
-            "счета и карты", "без переводов", "операции", "все операции"
+            "счета и карты", "без переводов", "операции", "все операции",
+            "счёт", "карта", "остаток", "баланс"
         ]
         line_lower = line.lower()
-        return any(sw in line_lower for sw in service_words) or line in ["+1", "+2", "+3"]
+        return any(sw in line_lower for sw in service_words) or line in ["+1", "+2", "+3", ")", "("]
     
     while i < len(lines):
         line = lines[i]
         
         # Ищем дату
-        for pattern in date_patterns:
+        found_date = False
+        for pattern, ptype in date_patterns:
             m = re.match(pattern, line, re.IGNORECASE)
             if m:
                 try:
-                    if len(m.groups()) == 2:  # "11 мая"
+                    if ptype == 'ru':
                         day = int(m.group(1))
                         month = months_ru.get(m.group(2).lower(), 1)
                         year = datetime.now().year
                         current_date = f"{year:04d}-{month:02d}-{day:02d}"
-                    else:  # "11.05.2026"
+                    else:
                         day = int(m.group(1))
                         month = int(m.group(2))
                         year = int(m.group(3))
@@ -244,35 +251,32 @@ def parse_bank_screenshot(text: str) -> Tuple[Optional[str], List[Tuple[str, flo
                         current_date = f"{year:04d}-{month:02d}-{day:02d}"
                 except (ValueError, IndexError):
                     pass
-                i += 1
+                found_date = True
                 break
-        else:
-            # Не дата — проверяем, является ли описанием траты
-            # Формат банка: название на одной строке, сумма на следующей
-            if i + 1 < len(lines) and not is_service_line(line):
-                next_line = lines[i + 1]
-                amount = extract_amount(next_line)
-                
-                # Если на следующей строке сумма — это трата
-                if amount and amount > 0:
-                    # Пропускаем служебные строки между названием и суммой
-                    # Иногда есть строки типа "Переводы", "Супермаркеты"
-                    desc = line
-                    # Пропускаем следующую строку (сумму)
-                    i += 2
-                    # Пропускаем возможные служебные строки после суммы
-                    while i < len(lines) and is_service_line(lines[i]):
-                        i += 1
-                    
-                    expenses.append((desc, amount))
-                    continue
-            
+        
+        if found_date:
             i += 1
+            continue
+        
+        # Ищем трату: название на строке i, сумма на строке i+1
+        if not is_service_line(line) and i + 1 < len(lines):
+            next_line = lines[i + 1]
+            amount = extract_amount(next_line)
+            
+            if amount and amount > 0:
+                desc = line
+                i += 2
+                # Пропускаем служебные строки после суммы
+                while i < len(lines) and is_service_line(lines[i]):
+                    i += 1
+                expenses.append((desc, amount))
+                continue
+        
+        i += 1
     
     return current_date, expenses
 
 def guess_category(description: str) -> str:
-    """Угадывает категорию по описанию"""
     desc_lower = description.lower()
     keywords = {
         "Продукты": ["продукт", "пятероч", "магнит", "перекрест", "азбука", "лента", " Spar ", "вкусно", "еда", "овощ", "мясо", "молоко", "хлеб", "овощи", "фрукты", "супермаркет", "гипер", "покупка", "магазин", "торговый центр"],
@@ -290,9 +294,17 @@ def guess_category(description: str) -> str:
                 return cat
     return "Другое"
 
-# ==================== SCREENSHOT FLOW ====================
+# ==================== SCREENSHOT FLOW (без ConversationHandler) ====================
 async def process_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обрабатывает скриншот банковского приложения"""
+    user_id = update.message.from_user.id
+    
+    # Проверяем, не в режиме ли уже обработки скриншота
+    state = context.user_data.get("state", STATE_IDLE)
+    if state != STATE_IDLE:
+        await update.message.reply_text("⏳ Сначала заверши текущую операцию или отправь /cancel")
+        return
+    
     photo = update.message.photo[-1]
     file = await context.bot.get_file(photo.file_id)
     
@@ -307,7 +319,9 @@ async def process_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not text:
         await update.message.reply_text(
             "❌ Не удалось распознать текст.\n\n"
-            "Убедись, что на скриншоте видны операции.\n"
+            "Проверь:\n"
+            "• YANDEX_API_KEY и YANDEX_FOLDER_ID настроены в Railway\n"
+            "• На скриншоте видны операции\n\n"
             "Или добавь вручную: /add"
         )
         return
@@ -318,7 +332,8 @@ async def process_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not expenses:
         await update.message.reply_text(
             f"❌ Не нашёл трат в тексте.\n\nВот что распознал:\n```\n{text[:800]}\n```\n\n"
-            f"Формат: название → сумма (например, Магнит → -182,98 ₽)\nПопробуй /add",
+            f"Ожидаю формат: название → сумма (например, Магнит → -182,98 ₽)\n"
+            f"Попробуй /add",
             parse_mode="Markdown"
         )
         return
@@ -327,6 +342,7 @@ async def process_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE)
     context.user_data["screenshot_expenses"] = expenses
     context.user_data["screenshot_text"] = text
     context.user_data["parsed_date"] = parsed_date
+    context.user_data["state"] = STATE_SCREENSHOT_DATE
     
     # Показываем что распознали
     date_str = parsed_date or "не определена"
@@ -339,15 +355,20 @@ async def process_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE)
     msg += f"\n💰 *Итого:* {total:.2f} ₽"
     
     if parsed_date:
-        msg += f"\n\nУкажи дату (ДД.ММ.YYYY) или напиши 'сегодня'/'{parsed_date}':"
+        msg += f"\n\nВведи дату (ДД.ММ.YYYY), 'сегодня', 'вчера' или '{parsed_date}':"
     else:
-        msg += "\n\nУкажи дату (ДД.ММ.YYYY) или 'сегодня':"
+        msg += "\n\nВведи дату (ДД.ММ.YYYY), 'сегодня' или 'вчера':"
     
     await update.message.reply_text(msg, parse_mode="Markdown")
-    return WAITING_SCREENSHOT_DATE
 
-async def screenshot_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Получает дату для трат со скриншота"""
+async def handle_screenshot_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает ввод даты после скриншота"""
+    user_id = update.message.from_user.id
+    state = context.user_data.get("state")
+    
+    if state != STATE_SCREENSHOT_DATE:
+        return  # Не наше состояние — игнорируем
+    
     text = update.message.text.strip().lower()
     
     if text == "сегодня":
@@ -364,15 +385,10 @@ async def screenshot_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except ValueError:
                     continue
             else:
-                # Пробуем распарсить как есть
-                parsed = context.user_data.get("parsed_date")
-                if parsed and text in parsed:
-                    date_str = parsed
-                else:
-                    raise ValueError
+                raise ValueError
         except ValueError:
             await update.message.reply_text("❌ Неверный формат. Введи ДД.ММ.YYYY, 'сегодня' или 'вчера':")
-            return WAITING_SCREENSHOT_DATE
+            return
     
     context.user_data["screenshot_date"] = date_str
     expenses = context.user_data["screenshot_expenses"]
@@ -393,19 +409,18 @@ async def screenshot_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     
     await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
-    return WAITING_SCREENSHOT_CONFIRM
+    context.user_data["state"] = STATE_SCREENSHOT_CONFIRM
 
-async def screenshot_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает подтверждение скриншота"""
+async def screenshot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает кнопки после скриншота"""
     query = update.callback_query
     await query.answer()
     action = query.data
     
     if action == "ss_cancel":
         await query.edit_message_text("❌ Отменено.")
-        for key in ["screenshot_expenses", "screenshot_date", "screenshot_text", "parsed_date", "ss_categories", "ss_edit_index"]:
-            context.user_data.pop(key, None)
-        return ConversationHandler.END
+        clear_screenshot_data(context)
+        return
     
     if action == "ss_save_all":
         expenses = context.user_data.get("screenshot_expenses", [])
@@ -421,19 +436,41 @@ async def screenshot_confirm_callback(update: Update, context: ContextTypes.DEFA
             f"✅ Сохранено *{len(expenses)}* трат на сумму *{total:.2f} ₽*",
             parse_mode="Markdown"
         )
-        for key in ["screenshot_expenses", "screenshot_date", "screenshot_text", "parsed_date", "ss_categories", "ss_edit_index"]:
-            context.user_data.pop(key, None)
-        return ConversationHandler.END
+        clear_screenshot_data(context)
+        return
     
     if action == "ss_edit_cats":
         expenses = context.user_data.get("screenshot_expenses", [])
         if not expenses:
             await query.edit_message_text("❌ Ошибка.")
-            return ConversationHandler.END
+            clear_screenshot_data(context)
+            return
         
         context.user_data["ss_edit_index"] = 0
-        context.user_data["ss_categories"] = []
-        return await show_category_selector(query, context)
+        context.user_data["ss_categories"] = [guess_category(e[0]) for e in expenses]
+        context.user_data["state"] = STATE_SCREENSHOT_EDIT_CAT
+        await show_category_selector(query, context)
+
+async def screenshot_category_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает выбор категории для траты"""
+    query = update.callback_query
+    await query.answer()
+    category = query.data.replace("sscat_", "")
+    
+    idx = context.user_data.get("ss_edit_index", 0)
+    expenses = context.user_data.get("screenshot_expenses", [])
+    
+    if idx >= len(expenses):
+        await save_all_after_edit(query, context)
+        return
+    
+    context.user_data["ss_categories"][idx] = category
+    context.user_data["ss_edit_index"] = idx + 1
+    
+    if context.user_data["ss_edit_index"] >= len(expenses):
+        await save_all_after_edit(query, context)
+    else:
+        await show_category_selector(query, context)
 
 async def show_category_selector(query, context: ContextTypes.DEFAULT_TYPE):
     """Показывает выбор категории для текущей траты"""
@@ -441,14 +478,11 @@ async def show_category_selector(query, context: ContextTypes.DEFAULT_TYPE):
     expenses = context.user_data.get("screenshot_expenses", [])
     
     if idx >= len(expenses):
-        return await save_all_after_edit(query, context)
+        await save_all_after_edit(query, context)
+        return
     
     desc, amount = expenses[idx]
-    current_cat = guess_category(desc)
-    
-    # Дополняем список категорий до текущего индекса
-    while len(context.user_data.get("ss_categories", [])) <= idx:
-        context.user_data.setdefault("ss_categories", []).append(guess_category(expenses[len(context.user_data["ss_categories"])][0]))
+    current_cat = context.user_data["ss_categories"][idx]
     
     keyboard = []
     for i in range(0, len(DEFAULT_CATEGORIES), 2):
@@ -463,27 +497,6 @@ async def show_category_selector(query, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown"
     )
-
-async def screenshot_category_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает выбор категории для траты со скриншота"""
-    query = update.callback_query
-    await query.answer()
-    category = query.data.replace("sscat_", "")
-    
-    idx = context.user_data.get("ss_edit_index", 0)
-    expenses = context.user_data.get("screenshot_expenses", [])
-    
-    if idx < len(expenses):
-        context.user_data.setdefault("ss_categories", [])
-        while len(context.user_data["ss_categories"]) <= idx:
-            context.user_data["ss_categories"].append(guess_category(expenses[len(context.user_data["ss_categories"])][0]))
-        
-        context.user_data["ss_categories"][idx] = category
-        context.user_data["ss_edit_index"] = idx + 1
-        
-        return await show_category_selector(query, context)
-    
-    return ConversationHandler.END
 
 async def save_all_after_edit(query, context: ContextTypes.DEFAULT_TYPE):
     """Сохраняет все траты после ручного выбора категорий"""
@@ -502,13 +515,19 @@ async def save_all_after_edit(query, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
     
-    for key in ["screenshot_expenses", "screenshot_date", "screenshot_text", "parsed_date", "ss_categories", "ss_edit_index"]:
+    clear_screenshot_data(context)
+
+def clear_screenshot_data(context: ContextTypes.DEFAULT_TYPE):
+    """Очищает данные скриншота"""
+    keys = ["screenshot_expenses", "screenshot_date", "screenshot_text", "parsed_date", 
+            "ss_categories", "ss_edit_index", "state"]
+    for key in keys:
         context.user_data.pop(key, None)
-    
-    return ConversationHandler.END
 
 # ==================== MANUAL ADD ====================
 async def add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Сбрасываем состояние скриншота, если было
+    clear_screenshot_data(context)
     await update.message.reply_text("Введи сумму (250.50):")
     return WAITING_AMOUNT
 
@@ -537,17 +556,20 @@ async def add_category_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
 # ==================== REPORTS ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    clear_screenshot_data(context)
     await update.message.reply_text(
         "👋 Бот учёта трат!\n\n"
         "📸 Отправь скриншот из банковского приложения\n"
         "✏️ /add — добавить вручную\n"
         "📊 /week /month /categories — отчёты\n"
         "📝 /list — редактировать или удалить\n"
-        "📤 /export — бэкап CSV\n\n"
+        "📤 /export — бэкап CSV\n"
+        "❌ /cancel — отменить текущую операцию\n\n"
         "Категории: " + ", ".join(DEFAULT_CATEGORIES)
     )
 
 async def week_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    clear_screenshot_data(context)
     uid = update.message.from_user.id
     total = sum(r[1] for r in get_expenses(uid, 7))
     by_cat = get_summary_by_category(uid, 7)
@@ -557,6 +579,7 @@ async def week_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text or "Нет трат за неделю.", parse_mode="Markdown")
 
 async def month_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    clear_screenshot_data(context)
     uid = update.message.from_user.id
     total = sum(r[1] for r in get_expenses(uid, 30))
     by_cat = get_summary_by_category(uid, 30)
@@ -566,6 +589,7 @@ async def month_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text or "Нет трат за месяц.", parse_mode="Markdown")
 
 async def categories_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    clear_screenshot_data(context)
     uid = update.message.from_user.id
     by_cat = get_summary_by_category(uid, 30)
     if not by_cat:
@@ -577,6 +601,7 @@ async def categories_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode="Markdown")
 
 async def export_csv(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    clear_screenshot_data(context)
     uid = update.message.from_user.id
     rows = get_expenses(uid)
     if not rows:
@@ -590,8 +615,13 @@ async def export_csv(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_document(document=open(fn, "rb"), caption="📤 Экспорт трат")
     os.remove(fn)
 
+async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    clear_screenshot_data(context)
+    await update.message.reply_text("✅ Операция отменена.")
+
 # ==================== EDIT ====================
 async def list_expenses(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    clear_screenshot_data(context)
     uid = update.message.from_user.id
     rows = get_expenses(uid, 30)
     if not rows:
@@ -698,6 +728,7 @@ def main():
     ptb_app.add_handler(CommandHandler("month", month_report))
     ptb_app.add_handler(CommandHandler("categories", categories_report))
     ptb_app.add_handler(CommandHandler("export", export_csv))
+    ptb_app.add_handler(CommandHandler("cancel", cancel_cmd))
 
     # Ручное добавление
     ptb_app.add_handler(ConversationHandler(
@@ -706,8 +737,7 @@ def main():
             WAITING_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_amount)],
             WAITING_CATEGORY: [CallbackQueryHandler(add_category_callback, pattern=r"^addcat_")],
         },
-        fallbacks=[CommandHandler("cancel", lambda u, c: u.message.reply_text("Отменено."))],
-        per_message=True,
+        fallbacks=[CommandHandler("cancel", cancel_cmd)],
     ))
 
     # Редактирование
@@ -721,23 +751,16 @@ def main():
             ],
             WAITING_EDIT_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_value)],
         },
-        fallbacks=[CommandHandler("cancel", lambda u, c: u.message.reply_text("Отменено."))],
-        per_message=True,
+        fallbacks=[CommandHandler("cancel", cancel_cmd)],
     ))
 
-    # Скриншот — отдельный ConversationHandler
-    ptb_app.add_handler(ConversationHandler(
-        entry_points=[MessageHandler(filters.PHOTO, process_screenshot)],
-        states={
-            WAITING_SCREENSHOT_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, screenshot_date)],
-            WAITING_SCREENSHOT_CONFIRM: [
-                CallbackQueryHandler(screenshot_confirm_callback, pattern=r"^ss_"),
-                CallbackQueryHandler(screenshot_category_callback, pattern=r"^sscat_"),
-            ],
-        },
-        fallbacks=[CommandHandler("cancel", lambda u, c: u.message.reply_text("Отменено."))],
-        per_message=True,
-    ))
+    # Скриншот — обычные хендлеры, не ConversationHandler
+    ptb_app.add_handler(MessageHandler(filters.PHOTO, process_screenshot))
+    ptb_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_screenshot_date))
+    
+    # Callback для скриншота
+    ptb_app.add_handler(CallbackQueryHandler(screenshot_callback, pattern=r"^ss_"))
+    ptb_app.add_handler(CallbackQueryHandler(screenshot_category_callback, pattern=r"^sscat_"))
 
     aio_app = web.Application()
     aio_app['ptb_app'] = ptb_app
