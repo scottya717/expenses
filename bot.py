@@ -46,21 +46,8 @@ logger = logging.getLogger(__name__)
 
 # ==================== DB ====================
 def get_conn():
-    """Создаёт подключение к PostgreSQL"""
-    import ssl
-    ssl_context = ssl.create_default_context()
-    ssl_context.check_hostname = False
-    ssl_context.verify_mode = ssl.CERT_NONE
-    
-    return psycopg2.connect(
-        DATABASE_URL, 
-        sslmode='require',
-        sslrootcert=None,
-        sslcert=None,
-        sslkey=None,
-        sslcrl=None,
-        ssl_min_protocol_version=None
-    )
+    return psycopg2.connect(DATABASE_URL, sslmode='disable')
+
 
 def init_db():
     conn = get_conn()
