@@ -15,7 +15,6 @@ from telegram.ext import (
     CommandHandler,
     MessageHandler,
     CallbackQueryHandler,
-    ConversationHandler,
     ContextTypes,
     filters,
 )
@@ -28,13 +27,15 @@ YANDEX_FOLDER_ID = os.environ.get("YANDEX_FOLDER_ID")
 
 DB_PATH = "/app/data/expenses.db"
 
-# Состояния ConversationHandler
-WAITING_AMOUNT, WAITING_CATEGORY, WAITING_NEW_CATEGORY, \
-WAITING_EDIT_SELECT, WAITING_EDIT_FIELD, WAITING_EDIT_VALUE, \
-WAITING_IMPORT_FILE = range(7)
-
-# Состояния скриншот-флоу (храним в user_data["state"])
+# Единые состояния для ВСЕХ флоу
 STATE_IDLE = "idle"
+STATE_ADD_AMOUNT = "add_amount"
+STATE_ADD_CATEGORY = "add_category"
+STATE_SETCATEGORY = "setcategory"
+STATE_LIST_SELECT = "list_select"
+STATE_LIST_FIELD = "list_field"
+STATE_LIST_VALUE = "list_value"
+STATE_IMPORT = "import"
 STATE_SCREENSHOT_DATE = "screenshot_date"
 STATE_SCREENSHOT_CONFIRM = "screenshot_confirm"
 STATE_SCREENSHOT_EDIT_CAT = "screenshot_edit_cat"
@@ -233,56 +234,75 @@ def parse_bank_screenshot(text: str) -> Tuple[Optional[str], List[Tuple[str, flo
     }
     
     def extract_amount(s: str) -> Optional[float]:
+        # Убираем знак + в начале — это доход
         if re.match(r'^\s*\+', s):
             return None
         
+        # Ищем число с/без ₽
+        # Сначала ищем полный паттерн с ₽
         patterns = [
             r'[-–]?\s*([\d\s]+[.,]\d{2})\s*[₽PРp]',
             r'[-–]?\s*([\d\s]+)\s*[₽PРp]',
             r'[-–]?\s*([\d\s]+[.,]\d{2})',
-            r'[-–]?\s*([\d\s]{3,})',
+            r'[-–]?\s*([\d\s]{2,})',
         ]
         for p in patterns:
             m = re.search(p, s)
             if m:
                 try:
                     val = m.group(1).replace(" ", "").replace(",", ".")
-                    return abs(float(val))
+                    f = abs(float(val))
+                    # Фильтруем явно неверные значения
+                    if f > 0 and f < 1000000:
+                        return f
                 except ValueError:
                     continue
         return None
     
     def is_service_line(line: str) -> bool:
+        """Проверяет, является ли строка служебной (UI элемент банка)."""
         line_lower = line.lower().strip()
         
-        exact_service = [
-            "переводы", "двойной чёрный", "дебетовая карта", "супермаркеты",
+        # Точные совпадения — UI-элементы
+        exact_service = {
+            "переводы", "двойной чёрный", "двойной черный", "дебетовая карта",
             "местный транспорт", "перевод", "зачисление", "доходы", "траты",
             "счета и карты", "без переводов", "операции", "все операции",
             "счёт", "карта", "остаток", "баланс", "пополнение", "зачисление",
-            "входящий", "возврат", "кэшбэк", ")", "(", "+1", "+2", "+3"
-        ]
+            "входящий", "возврат", "кэшбэк", ")", "(", "+1", "+2", "+3",
+            "двойной чёрный", "двойной черный",
+        }
         if line_lower in exact_service:
             return True
         
-        section_headers = [
+        # Заголовки секций
+        section_headers = {
             "счета и карты", "без переводов", "все операции", "операции",
-            "доходы", "траты", "переводы", "остаток", "баланс"
-        ]
+            "доходы", "траты", "переводы", "остаток", "баланс",
+        }
         if line_lower in section_headers:
             return True
         
+        # Категории-заголовки (короткие, без сумм)
+        category_headers = {
+            "супермаркеты", "кафе и рестораны", "развлечения", "здоровье",
+            "одежда", "коммунальные", "связь", "образование", "спорт",
+            "фото и копицентры", "фото и копи центры", "фото",
+        }
+        if line_lower in category_headers:
+            return True
+        
+        # Проверяем "транспорт" — если в строке есть сумма, это трата, не заголовок
         if "транспорт" in line_lower:
+            # Если в строке есть сумма — это реальная трата
             if extract_amount(line) is not None:
                 return False
+            # Если строка очень короткая — скорее всего заголовок категории
             if len(line_lower) < 25:
                 return True
         
-        category_headers = [
-            "супермаркеты", "кафе и рестораны", "развлечения", "здоровье",
-            "одежда", "коммунальные", "связь", "образование", "спорт"
-        ]
-        if line_lower in category_headers:
+        # "Местный транспорт" — всегда служебная строка (категория в банке)
+        if "местный транспорт" in line_lower:
             return True
         
         return False
@@ -295,10 +315,12 @@ def parse_bank_screenshot(text: str) -> Tuple[Optional[str], List[Tuple[str, flo
     while i < len(lines):
         line = lines[i]
         
+        # Пропускаем доходы
         if is_income(line):
             i += 1
             continue
         
+        # Ищем дату
         found_date = False
         for pattern, ptype in date_patterns:
             m = re.match(pattern, line, re.IGNORECASE)
@@ -325,20 +347,26 @@ def parse_bank_screenshot(text: str) -> Tuple[Optional[str], List[Tuple[str, flo
             i += 1
             continue
         
+        # Пытаемся найти пару: описание + сумма
         if not is_service_line(line) and not is_income(line) and i + 1 < len(lines):
             next_line = lines[i + 1]
             
+            # Если следующая строка — доход, пропускаем пару
             if is_income(next_line):
                 i += 2
                 continue
             
+            # Пробуем извлечь сумму из следующей строки
             amount = extract_amount(next_line)
             
             if amount and amount > 0:
                 desc = line
                 i += 2
+                
+                # Пропускаем служебные строки после траты
                 while i < len(lines) and (is_service_line(lines[i]) or is_income(lines[i])):
                     i += 1
+                
                 expenses.append((desc, amount))
                 continue
         
@@ -458,11 +486,11 @@ async def screenshot_date_callback(update: Update, context: ContextTypes.DEFAULT
     
     date_str = action.replace("ssdate_", "")
     context.user_data["screenshot_date"] = date_str
+    context.user_data["state"] = STATE_SCREENSHOT_CONFIRM
     
     await show_confirm_screen(query, context)
 
 async def handle_screenshot_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
     state = context.user_data.get("state")
     
     if state != STATE_SCREENSHOT_DATE:
@@ -867,63 +895,165 @@ def clear_screenshot_data(context: ContextTypes.DEFAULT_TYPE):
     for key in keys:
         context.user_data.pop(key, None)
 
-# ==================== CUSTOM CATEGORIES ====================
-async def setcategory_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ==================== ADD EXPENSE MANUALLY ====================
+async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     clear_screenshot_data(context)
-    await update.message.reply_text(
-        "📝 Введи название новой категории:\n"
-        "(например: Спорт, Подарки, Обучение)\n\n"
-        "Текущие категории:\n" + "\n".join(f"• {c}" for c in get_user_categories(update.message.from_user.id))
-    )
-    return WAITING_NEW_CATEGORY
-
-async def setcategory_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    category = update.message.text.strip()
-    if not category or len(category) > 50:
-        await update.message.reply_text("❌ Название слишком длинное или пустое. Попробуй ещё:")
-        return WAITING_NEW_CATEGORY
-    
-    add_user_category(update.message.from_user.id, category)
-    await update.message.reply_text(
-        f"✅ Категория *{category}* добавлена!\n\n"
-        f"Теперь она будет в списке при добавлении трат.",
-        parse_mode="Markdown"
-    )
-    return ConversationHandler.END
-
-# ==================== MANUAL ADD ====================
-async def add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    clear_screenshot_data(context)
+    context.user_data["state"] = STATE_ADD_AMOUNT
     await update.message.reply_text("Введи сумму (250.50):")
-    return WAITING_AMOUNT
 
-async def add_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_add_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.get("state") != STATE_ADD_AMOUNT:
+        return
+    
     try:
         amount = float(update.message.text.replace(",", ".").replace(" ", ""))
         context.user_data["add_amount"] = amount
+        context.user_data["state"] = STATE_ADD_CATEGORY
         user_cats = get_user_categories(update.message.from_user.id)
         keyboard = [
             [InlineKeyboardButton(cat, callback_data=f"addcat_{cat}") for cat in user_cats[i:i+2]]
             for i in range(0, len(user_cats), 2)
         ]
         await update.message.reply_text("Выбери категорию:", reply_markup=InlineKeyboardMarkup(keyboard))
-        return WAITING_CATEGORY
     except ValueError:
         await update.message.reply_text("❌ Неверный формат. Введи число:")
-        return WAITING_AMOUNT
 
 async def add_category_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    
+    if context.user_data.get("state") != STATE_ADD_CATEGORY:
+        return
+    
     category = query.data.replace("addcat_", "")
     amount = context.user_data["add_amount"]
     add_expense(query.from_user.id, amount, category)
+    context.user_data["state"] = STATE_IDLE
     await query.edit_message_text(f"✅ Добавлено: *{amount:.2f} ₽* — {category}", parse_mode="Markdown")
-    return ConversationHandler.END
+
+# ==================== CUSTOM CATEGORIES ====================
+async def cmd_setcategory(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    clear_screenshot_data(context)
+    context.user_data["state"] = STATE_SETCATEGORY
+    await update.message.reply_text(
+        "📝 Введи название новой категории:\n"
+        "(например: Спорт, Подарки, Обучение)\n\n"
+        "Текущие категории:\n" + "\n".join(f"• {c}" for c in get_user_categories(update.message.from_user.id))
+    )
+
+async def handle_setcategory(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.get("state") != STATE_SETCATEGORY:
+        return
+    
+    category = update.message.text.strip()
+    if not category or len(category) > 50:
+        await update.message.reply_text("❌ Название слишком длинное или пустое. Попробуй ещё:")
+        return
+    
+    add_user_category(update.message.from_user.id, category)
+    context.user_data["state"] = STATE_IDLE
+    await update.message.reply_text(
+        f"✅ Категория *{category}* добавлена!\n\n"
+        f"Теперь она будет в списке при добавлении трат.",
+        parse_mode="Markdown"
+    )
+
+# ==================== LIST & EDIT ====================
+async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    clear_screenshot_data(context)
+    uid = update.message.from_user.id
+    rows = get_expenses(uid, 30)
+    if not rows:
+        await update.message.reply_text("Нет записей.")
+        context.user_data["state"] = STATE_IDLE
+        return
+    
+    context.user_data["state"] = STATE_LIST_SELECT
+    keyboard = []
+    text = "📝 *Последние траты:*\n\n"
+    for row in rows[:20]:
+        eid, amount, category, desc, date = row
+        text += f"#{eid} | {date[:10]} | {amount:.0f} ₽ | {category}\n"
+        keyboard.append([InlineKeyboardButton(f"✏️ #{eid} — {amount:.0f} ₽ ({category})", callback_data=f"edit_{eid}")])
+    await update.message.reply_text(text + "\nВыбери запись:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+async def edit_select_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    if context.user_data.get("state") != STATE_LIST_SELECT:
+        return
+    
+    eid = int(query.data.replace("edit_", ""))
+    context.user_data["edit_id"] = eid
+    row = get_expense_by_id(eid, query.from_user.id)
+    if not row:
+        await query.edit_message_text("❌ Не найдено.")
+        context.user_data["state"] = STATE_IDLE
+        return
+    
+    _, amount, category, desc, date = row
+    keyboard = [
+        [InlineKeyboardButton("💰 Сумма", callback_data="editfield_amount")],
+        [InlineKeyboardButton("📂 Категория", callback_data="editfield_category")],
+        [InlineKeyboardButton("🗑 Удалить", callback_data="editfield_delete")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="edit_cancel")],
+    ]
+    context.user_data["state"] = STATE_LIST_FIELD
+    await query.edit_message_text(
+        f"✏️ #{eid}:\nСумма: {amount:.2f} ₽\nКатегория: {category}\nДата: {date[:10]}\n\nЧто изменить?",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+async def edit_field_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    if context.user_data.get("state") != STATE_LIST_FIELD:
+        return
+    
+    field = query.data.replace("editfield_", "")
+    if field == "delete":
+        delete_expense(context.user_data["edit_id"], query.from_user.id)
+        context.user_data["state"] = STATE_IDLE
+        await query.edit_message_text("🗑 Удалено.")
+        return
+    if field == "cancel":
+        context.user_data["state"] = STATE_IDLE
+        await query.edit_message_text("Отменено.")
+        return
+    
+    context.user_data["edit_field"] = field
+    context.user_data["state"] = STATE_LIST_VALUE
+    names = {"amount": "сумму", "category": "категорию"}
+    await query.edit_message_text(f"Введи новую {names.get(field, field)}:")
+
+async def edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.get("state") != STATE_LIST_VALUE:
+        return
+    
+    uid = update.message.from_user.id
+    eid = context.user_data["edit_id"]
+    field = context.user_data["edit_field"]
+    
+    if field == "amount":
+        try:
+            val = float(update.message.text.replace(",", ".").replace(" ", ""))
+            update_expense(eid, uid, "amount", val)
+            await update.message.reply_text(f"✅ Сумма: {val:.2f} ₽")
+        except ValueError:
+            await update.message.reply_text("❌ Неверный формат.")
+    elif field == "category":
+        val = update.message.text.strip()
+        update_expense(eid, uid, "category", val)
+        await update.message.reply_text(f"✅ Категория: {val}")
+    
+    context.user_data["state"] = STATE_IDLE
 
 # ==================== IMPORT CSV ====================
-async def import_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_import(update: Update, context: ContextTypes.DEFAULT_TYPE):
     clear_screenshot_data(context)
+    context.user_data["state"] = STATE_IMPORT
     await update.message.reply_text(
         "📥 *Импорт из CSV*\n\n"
         "Отправь файл `.csv` со следующими колонками:\n"
@@ -933,19 +1063,21 @@ async def import_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "❌ /cancel — отменить",
         parse_mode="Markdown"
     )
-    return WAITING_IMPORT_FILE
 
-async def import_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_import_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.get("state") != STATE_IMPORT:
+        return
+    
     user_id = update.message.from_user.id
     
     if not update.message.document:
         await update.message.reply_text("❌ Пожалуйста, отправь файл CSV.")
-        return WAITING_IMPORT_FILE
+        return
     
     doc = update.message.document
     if not doc.file_name.lower().endswith('.csv'):
         await update.message.reply_text("❌ Нужен файл с расширением `.csv`")
-        return WAITING_IMPORT_FILE
+        return
     
     try:
         file = await context.bot.get_file(doc.file_id)
@@ -956,22 +1088,21 @@ async def import_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Import download error: {e}")
         await update.message.reply_text("❌ Ошибка загрузки файла.")
-        return ConversationHandler.END
+        context.user_data["state"] = STATE_IDLE
+        return
     
-    # Парсим CSV
     lines = content.strip().split('\n')
     if not lines:
         await update.message.reply_text("❌ Файл пустой.")
-        return ConversationHandler.END
+        context.user_data["state"] = STATE_IDLE
+        return
     
-    # Определяем разделитель
     first_line = lines[0]
     delimiter = ';' if ';' in first_line else ','
     
     imported = 0
     errors = []
     
-    # Пропускаем заголовок, если есть
     start_idx = 0
     header_keywords = ['сумма', 'amount', 'категория', 'category', 'дата', 'date', 'описание', 'description']
     first_lower = first_line.lower()
@@ -985,23 +1116,16 @@ async def import_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         parts = [p.strip().strip('"').strip("'") for p in line.split(delimiter)]
         
-        # Пытаемся определить формат: количество колонок
         if len(parts) < 2:
             errors.append(f"Строка {i}: мало колонок")
             continue
-        
-        # Формат 1: Сумма,Категория,Описание,Дата (4 колонки)
-        # Формат 2: Сумма,Категория,Дата (3 колонки, без описания)
-        # Формат 3: Дата,Сумма,Категория,Описание (дата первой)
         
         amount = None
         category = None
         description = ""
         date_str = None
         
-        # Пробуем найти сумму (число с/без копеек)
         for j, part in enumerate(parts):
-            # Пробуем распарсить как сумму
             clean = part.replace(" ", "").replace(",", ".").replace("₽", "").replace("р", "")
             try:
                 val = float(clean)
@@ -1016,7 +1140,6 @@ async def import_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             errors.append(f"Строка {i}: не найдена сумма")
             continue
         
-        # Ищем дату
         date_patterns = [
             (r'^\d{4}-\d{2}-\d{2}$', '%Y-%m-%d'),
             (r'^\d{2}\.\d{2}\.\d{4}$', '%d.%m.%Y'),
@@ -1040,16 +1163,12 @@ async def import_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 break
         
         if date_str is None:
-            # Если даты нет — используем сегодня
             date_str = datetime.now().strftime('%Y-%m-%d')
             date_idx = -1
         
-        # Оставшиеся колонки — категория и описание
         remaining = [(j, p) for j, p in enumerate(parts) if j != amount_idx and j != date_idx]
         
-        # Самая короткая строка (до 50 символов) — категория, остальное — описание
         if len(remaining) >= 1:
-            # Ищем категорию — обычно это известная категория или короткая строка
             cats_lower = [c.lower() for c in get_user_categories(user_id)]
             found_cat = False
             
@@ -1064,22 +1183,18 @@ async def import_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 category = remaining[0][1]
                 cat_idx = remaining[0][0]
             
-            # Описание — всё остальное
             desc_parts = [p for j, p in remaining if j != cat_idx]
             description = " ".join(desc_parts).strip() or ""
         
         if not category:
             category = "Другое"
         
-        # Сохраняем
         add_expense(user_id, amount, category, description, date_str)
         imported += 1
         
-        # Добавляем категорию пользователя, если новая
         if category not in get_user_categories(user_id):
             add_user_category(user_id, category)
     
-    # Формируем отчёт
     msg = f"✅ *Импорт завершён*\n\n"
     msg += f"📥 Импортировано: *{imported}* записей\n"
     if errors:
@@ -1089,10 +1204,10 @@ async def import_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg += f"\n... и ещё {len(errors) - 10}"
     
     await update.message.reply_text(msg, parse_mode="Markdown")
-    return ConversationHandler.END
+    context.user_data["state"] = STATE_IDLE
 
 # ==================== REPORTS ====================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     clear_screenshot_data(context)
     cats = get_user_categories(update.message.from_user.id)
     await update.message.reply_text(
@@ -1108,7 +1223,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Категории: " + ", ".join(cats)
     )
 
-async def week_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
     clear_screenshot_data(context)
     uid = update.message.from_user.id
     total = sum(r[1] for r in get_expenses(uid, 7))
@@ -1118,7 +1233,7 @@ async def week_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += f"• {cat}: {s:.2f} ₽ ({c} шт.)\n"
     await update.message.reply_text(text or "Нет трат за неделю.", parse_mode="Markdown")
 
-async def month_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
     clear_screenshot_data(context)
     uid = update.message.from_user.id
     total = sum(r[1] for r in get_expenses(uid, 30))
@@ -1128,7 +1243,7 @@ async def month_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += f"• {cat}: {s:.2f} ₽ ({c} шт.)\n"
     await update.message.reply_text(text or "Нет трат за месяц.", parse_mode="Markdown")
 
-async def categories_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_categories(update: Update, context: ContextTypes.DEFAULT_TYPE):
     clear_screenshot_data(context)
     uid = update.message.from_user.id
     by_cat = get_summary_by_category(uid, 30)
@@ -1140,7 +1255,7 @@ async def categories_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += f"• {cat}: {s:.2f} ₽ ({c} шт.)\n"
     await update.message.reply_text(text, parse_mode="Markdown")
 
-async def export_csv(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
     clear_screenshot_data(context)
     uid = update.message.from_user.id
     rows = get_expenses(uid)
@@ -1157,95 +1272,38 @@ async def export_csv(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_document(document=open(fn, "rb"), caption="📤 Экспорт трат")
     os.remove(fn)
 
-async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     clear_screenshot_data(context)
+    context.user_data["state"] = STATE_IDLE
     await update.message.reply_text("✅ Операция отменена.")
 
-# ==================== EDIT ====================
-async def list_expenses(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    clear_screenshot_data(context)
-    uid = update.message.from_user.id
-    rows = get_expenses(uid, 30)
-    if not rows:
-        await update.message.reply_text("Нет записей.")
-        return ConversationHandler.END
-    keyboard = []
-    text = "📝 *Последние траты:*\n\n"
-    for row in rows[:20]:
-        eid, amount, category, desc, date = row
-        text += f"#{eid} | {date[:10]} | {amount:.0f} ₽ | {category}\n"
-        keyboard.append([InlineKeyboardButton(f"✏️ #{eid} — {amount:.0f} ₽ ({category})", callback_data=f"edit_{eid}")])
-    await update.message.reply_text(text + "\nВыбери запись:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
-    return WAITING_EDIT_SELECT
-
-async def edit_select_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    eid = int(query.data.replace("edit_", ""))
-    context.user_data["edit_id"] = eid
-    row = get_expense_by_id(eid, query.from_user.id)
-    if not row:
-        await query.edit_message_text("❌ Не найдено.")
-        return ConversationHandler.END
-    _, amount, category, desc, date = row
-    keyboard = [
-        [InlineKeyboardButton("💰 Сумма", callback_data="editfield_amount")],
-        [InlineKeyboardButton("📂 Категория", callback_data="editfield_category")],
-        [InlineKeyboardButton("🗑 Удалить", callback_data="editfield_delete")],
-        [InlineKeyboardButton("❌ Отмена", callback_data="edit_cancel")],
-    ]
-    await query.edit_message_text(
-        f"✏️ #{eid}:\nСумма: {amount:.2f} ₽\nКатегория: {category}\nДата: {date[:10]}\n\nЧто изменить?",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
-    return WAITING_EDIT_FIELD
-
-async def edit_field_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    field = query.data.replace("editfield_", "")
-    if field == "delete":
-        delete_expense(context.user_data["edit_id"], query.from_user.id)
-        await query.edit_message_text("🗑 Удалено.")
-        return ConversationHandler.END
-    if field == "cancel":
-        await query.edit_message_text("Отменено.")
-        return ConversationHandler.END
-    context.user_data["edit_field"] = field
-    names = {"amount": "сумму", "category": "категорию"}
-    await query.edit_message_text(f"Введи новую {names.get(field, field)}:")
-    return WAITING_EDIT_VALUE
-
-async def edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.message.from_user.id
-    eid = context.user_data["edit_id"]
-    field = context.user_data["edit_field"]
-    if field == "amount":
-        try:
-            val = float(update.message.text.replace(",", ".").replace(" ", ""))
-            update_expense(eid, uid, "amount", val)
-            await update.message.reply_text(f"✅ Сумма: {val:.2f} ₽")
-        except ValueError:
-            await update.message.reply_text("❌ Неверный формат.")
-    elif field == "category":
-        val = update.message.text.strip()
-        update_expense(eid, uid, "category", val)
-        await update.message.reply_text(f"✅ Категория: {val}")
-    return ConversationHandler.END
-
-# ==================== UNIFIED TEXT HANDLER ====================
-async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Единый обработчик текстовых сообщений для скриншот-флоу.
-    Срабатывает ТОЛЬКО когда нет активного ConversationHandler."""
-    state = context.user_data.get("state")
+# ==================== UNIFIED MESSAGE HANDLER ====================
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Единый обработчик всех текстовых сообщений и документов.
+    Маршрутизирует в нужный обработчик по состоянию."""
+    state = context.user_data.get("state", STATE_IDLE)
     
-    if state == STATE_SCREENSHOT_DATE:
+    # Если пользователь отправил документ в режиме импорта
+    if update.message.document and state == STATE_IMPORT:
+        await handle_import_file(update, context)
+        return
+    
+    # Текстовые сообщения по состояниям
+    if state == STATE_IDLE:
+        # Не в активном флоу — игнорируем текст (или можно ответить подсказкой)
+        return
+    elif state == STATE_ADD_AMOUNT:
+        await handle_add_amount(update, context)
+    elif state == STATE_SETCATEGORY:
+        await handle_setcategory(update, context)
+    elif state == STATE_LIST_VALUE:
+        await edit_value(update, context)
+    elif state == STATE_SCREENSHOT_DATE:
         await handle_screenshot_date(update, context)
     elif state == STATE_SCREENSHOT_EDIT_AMOUNT:
         await handle_screenshot_amount(update, context)
-    else:
-        # Не в скриншот-флоу — игнорируем (ConversationHandler'ы сработают сами)
-        pass
+    # STATE_ADD_CATEGORY, STATE_LIST_SELECT, STATE_LIST_FIELD — обрабатываются через callback
+    # STATE_SCREENSHOT_CONFIRM, STATE_SCREENSHOT_EDIT_CAT, STATE_SCREENSHOT_DELETE — через callback
 
 # ==================== WEB SERVER ====================
 async def health(request):
@@ -1280,66 +1338,33 @@ def main():
     ptb_app = Application.builder().token(BOT_TOKEN).build()
 
     # === CommandHandler'ы — ВЫСШИЙ ПРИОРИТЕТ ===
-    ptb_app.add_handler(CommandHandler("start", start))
-    ptb_app.add_handler(CommandHandler("week", week_report))
-    ptb_app.add_handler(CommandHandler("month", month_report))
-    ptb_app.add_handler(CommandHandler("categories", categories_report))
-    ptb_app.add_handler(CommandHandler("export", export_csv))
-    ptb_app.add_handler(CommandHandler("cancel", cancel_cmd))
+    ptb_app.add_handler(CommandHandler("start", cmd_start))
+    ptb_app.add_handler(CommandHandler("add", cmd_add))
+    ptb_app.add_handler(CommandHandler("list", cmd_list))
+    ptb_app.add_handler(CommandHandler("setcategory", cmd_setcategory))
+    ptb_app.add_handler(CommandHandler("import", cmd_import))
+    ptb_app.add_handler(CommandHandler("week", cmd_week))
+    ptb_app.add_handler(CommandHandler("month", cmd_month))
+    ptb_app.add_handler(CommandHandler("categories", cmd_categories))
+    ptb_app.add_handler(CommandHandler("export", cmd_export))
+    ptb_app.add_handler(CommandHandler("cancel", cmd_cancel))
 
-    # === ConversationHandler'ы ===
-    ptb_app.add_handler(ConversationHandler(
-        entry_points=[CommandHandler("setcategory", setcategory_start)],
-        states={
-            WAITING_NEW_CATEGORY: [MessageHandler(filters.TEXT & ~filters.COMMAND, setcategory_save)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel_cmd)],
-    ))
-
-    ptb_app.add_handler(ConversationHandler(
-        entry_points=[CommandHandler("add", add_start)],
-        states={
-            WAITING_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_amount)],
-            WAITING_CATEGORY: [CallbackQueryHandler(add_category_callback, pattern=r"^addcat_")],
-        },
-        fallbacks=[CommandHandler("cancel", cancel_cmd)],
-    ))
-
-    ptb_app.add_handler(ConversationHandler(
-        entry_points=[CommandHandler("list", list_expenses)],
-        states={
-            WAITING_EDIT_SELECT: [CallbackQueryHandler(edit_select_callback, pattern=r"^edit_\d+$")],
-            WAITING_EDIT_FIELD: [
-                CallbackQueryHandler(edit_field_callback, pattern=r"^editfield_"),
-                CallbackQueryHandler(lambda u, c: u.callback_query.edit_message_text("Отменено."), pattern=r"^edit_cancel$"),
-            ],
-            WAITING_EDIT_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_value)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel_cmd)],
-    ))
-
-    # Импорт CSV
-    ptb_app.add_handler(ConversationHandler(
-        entry_points=[CommandHandler("import", import_start)],
-        states={
-            WAITING_IMPORT_FILE: [MessageHandler(filters.Document.ALL, import_file)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel_cmd)],
-    ))
-
-    # === Скриншот-флоу ===
-    ptb_app.add_handler(MessageHandler(filters.PHOTO, process_screenshot))
+    # === CallbackQueryHandler'ы ===
+    ptb_app.add_handler(CallbackQueryHandler(add_category_callback, pattern=r"^addcat_"))
+    ptb_app.add_handler(CallbackQueryHandler(edit_select_callback, pattern=r"^edit_\d+$"))
+    ptb_app.add_handler(CallbackQueryHandler(edit_field_callback, pattern=r"^editfield_"))
     
-    # Callback-обработчики скриншот-флоу
+    # Скриншот callback'и
     ptb_app.add_handler(CallbackQueryHandler(screenshot_date_callback, pattern=r"^ssdate_"))
     ptb_app.add_handler(CallbackQueryHandler(screenshot_callback, pattern=r"^ss_"))
     ptb_app.add_handler(CallbackQueryHandler(screenshot_category_callback, pattern=r"^sscat_"))
     ptb_app.add_handler(CallbackQueryHandler(screenshot_delete_callback, pattern=r"^ssdel_"))
     ptb_app.add_handler(CallbackQueryHandler(screenshot_amount_callback, pattern=r"^ssamt_"))
-    
-    # === Единый обработчик текстовых сообщений — САМЫЙ НИЗКИЙ ПРИОРИТЕТ ===
-    # Срабатывает только для скриншот-флоу, когда нет активного ConversationHandler
-    ptb_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
+
+    # === MessageHandler'ы — САМЫЙ НИЗКИЙ ПРИОРИТЕТ ===
+    ptb_app.add_handler(MessageHandler(filters.PHOTO, process_screenshot))
+    # Единый обработчик для ВСЕХ текстовых сообщений и документов
+    ptb_app.add_handler(MessageHandler(filters.TEXT | filters.Document.ALL, handle_message))
 
     aio_app = web.Application()
     aio_app['ptb_app'] = ptb_app
