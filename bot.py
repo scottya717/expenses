@@ -30,7 +30,8 @@ DB_PATH = "/app/data/expenses.db"
 
 # Состояния ConversationHandler
 WAITING_AMOUNT, WAITING_CATEGORY, WAITING_NEW_CATEGORY, \
-WAITING_EDIT_SELECT, WAITING_EDIT_FIELD, WAITING_EDIT_VALUE = range(6)
+WAITING_EDIT_SELECT, WAITING_EDIT_FIELD, WAITING_EDIT_VALUE, \
+WAITING_IMPORT_FILE = range(7)
 
 # Состояния скриншот-флоу (храним в user_data["state"])
 STATE_IDLE = "idle"
@@ -252,11 +253,8 @@ def parse_bank_screenshot(text: str) -> Tuple[Optional[str], List[Tuple[str, flo
         return None
     
     def is_service_line(line: str) -> bool:
-        """Служебные строки — заголовки, категории, UI-элементы банковского приложения.
-        НЕ отбрасываем реальные траты, даже если в описании есть слово 'транспорт'."""
         line_lower = line.lower().strip()
         
-        # Точные совпадения — UI-элементы
         exact_service = [
             "переводы", "двойной чёрный", "дебетовая карта", "супермаркеты",
             "местный транспорт", "перевод", "зачисление", "доходы", "траты",
@@ -267,7 +265,6 @@ def parse_bank_screenshot(text: str) -> Tuple[Optional[str], List[Tuple[str, flo
         if line_lower in exact_service:
             return True
         
-        # Заголовки секций (обычно короткие, без сумм)
         section_headers = [
             "счета и карты", "без переводов", "все операции", "операции",
             "доходы", "траты", "переводы", "остаток", "баланс"
@@ -275,17 +272,12 @@ def parse_bank_screenshot(text: str) -> Tuple[Optional[str], List[Tuple[str, flo
         if line_lower in section_headers:
             return True
         
-        # Если строка содержит "транспорт" — проверяем, это заголовок категории или реальная трата
-        # Заголовки категорий обычно короткие и без сумм
         if "транспорт" in line_lower:
-            # Если в строке есть сумма — это реальная трата
             if extract_amount(line) is not None:
                 return False
-            # Если строка очень короткая — скорее всего заголовок категории
             if len(line_lower) < 25:
                 return True
         
-        # Другие категории-заголовки (короткие, без сумм)
         category_headers = [
             "супермаркеты", "кафе и рестораны", "развлечения", "здоровье",
             "одежда", "коммунальные", "связь", "образование", "спорт"
@@ -694,7 +686,6 @@ async def show_amount_editor(query, context: ContextTypes.DEFAULT_TYPE):
     expenses = context.user_data.get("screenshot_expenses", [])
     
     if idx >= len(expenses):
-        # Все суммы отредактированы, переходим к подтверждению
         await show_confirm_screen(query, context)
         return
     
@@ -757,7 +748,6 @@ async def handle_screenshot_amount(update: Update, context: ContextTypes.DEFAULT
         expenses[idx] = (desc, new_amount)
         context.user_data["screenshot_expenses"] = expenses
         
-        # Обновляем суммы в контексте
         amounts = context.user_data.get("ss_amounts", [])
         if idx < len(amounts):
             amounts[idx] = new_amount
@@ -833,7 +823,6 @@ async def screenshot_category_callback(update: Update, context: ContextTypes.DEF
         return
     
     if action == "sscat_edit_amount":
-        # Переключаемся на редактирование суммы для текущей траты
         context.user_data["state"] = STATE_SCREENSHOT_EDIT_AMOUNT
         await show_amount_editor(query, context)
         return
@@ -932,6 +921,176 @@ async def add_category_callback(update: Update, context: ContextTypes.DEFAULT_TY
     await query.edit_message_text(f"✅ Добавлено: *{amount:.2f} ₽* — {category}", parse_mode="Markdown")
     return ConversationHandler.END
 
+# ==================== IMPORT CSV ====================
+async def import_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    clear_screenshot_data(context)
+    await update.message.reply_text(
+        "📥 *Импорт из CSV*\n\n"
+        "Отправь файл `.csv` со следующими колонками:\n"
+        "`Сумма,Категория,Описание,Дата`\n\n"
+        "Дата в формате `YYYY-MM-DD` или `DD.MM.YYYY`\n"
+        "Разделитель — запятая или точка с запятой\n\n"
+        "❌ /cancel — отменить",
+        parse_mode="Markdown"
+    )
+    return WAITING_IMPORT_FILE
+
+async def import_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    
+    if not update.message.document:
+        await update.message.reply_text("❌ Пожалуйста, отправь файл CSV.")
+        return WAITING_IMPORT_FILE
+    
+    doc = update.message.document
+    if not doc.file_name.lower().endswith('.csv'):
+        await update.message.reply_text("❌ Нужен файл с расширением `.csv`")
+        return WAITING_IMPORT_FILE
+    
+    try:
+        file = await context.bot.get_file(doc.file_id)
+        bio = BytesIO()
+        await file.download_to_memory(bio)
+        bio.seek(0)
+        content = bio.read().decode('utf-8-sig')
+    except Exception as e:
+        logger.error(f"Import download error: {e}")
+        await update.message.reply_text("❌ Ошибка загрузки файла.")
+        return ConversationHandler.END
+    
+    # Парсим CSV
+    lines = content.strip().split('\n')
+    if not lines:
+        await update.message.reply_text("❌ Файл пустой.")
+        return ConversationHandler.END
+    
+    # Определяем разделитель
+    first_line = lines[0]
+    delimiter = ';' if ';' in first_line else ','
+    
+    imported = 0
+    errors = []
+    
+    # Пропускаем заголовок, если есть
+    start_idx = 0
+    header_keywords = ['сумма', 'amount', 'категория', 'category', 'дата', 'date', 'описание', 'description']
+    first_lower = first_line.lower()
+    if any(kw in first_lower for kw in header_keywords):
+        start_idx = 1
+    
+    for i, line in enumerate(lines[start_idx:], start=start_idx+1):
+        line = line.strip()
+        if not line:
+            continue
+        
+        parts = [p.strip().strip('"').strip("'") for p in line.split(delimiter)]
+        
+        # Пытаемся определить формат: количество колонок
+        if len(parts) < 2:
+            errors.append(f"Строка {i}: мало колонок")
+            continue
+        
+        # Формат 1: Сумма,Категория,Описание,Дата (4 колонки)
+        # Формат 2: Сумма,Категория,Дата (3 колонки, без описания)
+        # Формат 3: Дата,Сумма,Категория,Описание (дата первой)
+        
+        amount = None
+        category = None
+        description = ""
+        date_str = None
+        
+        # Пробуем найти сумму (число с/без копеек)
+        for j, part in enumerate(parts):
+            # Пробуем распарсить как сумму
+            clean = part.replace(" ", "").replace(",", ".").replace("₽", "").replace("р", "")
+            try:
+                val = float(clean)
+                if val > 0 and amount is None:
+                    amount = val
+                    amount_idx = j
+                    break
+            except ValueError:
+                continue
+        
+        if amount is None:
+            errors.append(f"Строка {i}: не найдена сумма")
+            continue
+        
+        # Ищем дату
+        date_patterns = [
+            (r'^\d{4}-\d{2}-\d{2}$', '%Y-%m-%d'),
+            (r'^\d{2}\.\d{2}\.\d{4}$', '%d.%m.%Y'),
+            (r'^\d{2}\.\d{2}\.\d{2}$', '%d.%m.%y'),
+            (r'^\d{2}/\d{2}/\d{4}$', '%d/%m/%Y'),
+        ]
+        
+        for j, part in enumerate(parts):
+            if j == amount_idx:
+                continue
+            for pattern, fmt in date_patterns:
+                if re.match(pattern, part):
+                    try:
+                        dt = datetime.strptime(part, fmt)
+                        date_str = dt.strftime('%Y-%m-%d')
+                        date_idx = j
+                        break
+                    except ValueError:
+                        continue
+            if date_str:
+                break
+        
+        if date_str is None:
+            # Если даты нет — используем сегодня
+            date_str = datetime.now().strftime('%Y-%m-%d')
+            date_idx = -1
+        
+        # Оставшиеся колонки — категория и описание
+        remaining = [(j, p) for j, p in enumerate(parts) if j != amount_idx and j != date_idx]
+        
+        # Самая короткая строка (до 50 символов) — категория, остальное — описание
+        if len(remaining) >= 1:
+            # Ищем категорию — обычно это известная категория или короткая строка
+            cats_lower = [c.lower() for c in get_user_categories(user_id)]
+            found_cat = False
+            
+            for j, part in remaining:
+                if part.lower() in cats_lower or len(part) <= 30:
+                    category = part
+                    cat_idx = j
+                    found_cat = True
+                    break
+            
+            if not found_cat:
+                category = remaining[0][1]
+                cat_idx = remaining[0][0]
+            
+            # Описание — всё остальное
+            desc_parts = [p for j, p in remaining if j != cat_idx]
+            description = " ".join(desc_parts).strip() or ""
+        
+        if not category:
+            category = "Другое"
+        
+        # Сохраняем
+        add_expense(user_id, amount, category, description, date_str)
+        imported += 1
+        
+        # Добавляем категорию пользователя, если новая
+        if category not in get_user_categories(user_id):
+            add_user_category(user_id, category)
+    
+    # Формируем отчёт
+    msg = f"✅ *Импорт завершён*\n\n"
+    msg += f"📥 Импортировано: *{imported}* записей\n"
+    if errors:
+        msg += f"⚠️ Ошибок: *{len(errors)}*\n"
+        msg += "\n".join(errors[:10])
+        if len(errors) > 10:
+            msg += f"\n... и ещё {len(errors) - 10}"
+    
+    await update.message.reply_text(msg, parse_mode="Markdown")
+    return ConversationHandler.END
+
 # ==================== REPORTS ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     clear_screenshot_data(context)
@@ -943,6 +1102,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📊 /week /month /categories — отчёты\n"
         "📝 /list — редактировать или удалить\n"
         "📤 /export — бэкап CSV\n"
+        "📥 /import — загрузить CSV\n"
         "🏷 /setcategory — добавить свою категорию\n"
         "❌ /cancel — отменить\n\n"
         "Категории: " + ", ".join(cats)
@@ -989,9 +1149,11 @@ async def export_csv(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     fn = f"export_{uid}.csv"
     with open(fn, "w", newline="", encoding="utf-8-sig") as f:
-        w = csv.writer(f)
-        w.writerow(["ID", "Сумма", "Категория", "Описание", "Дата"])
-        w.writerows(rows)
+        w = csv.writer(f, delimiter=';', lineterminator='\n')
+        w.writerow(["Сумма", "Категория", "Описание", "Дата"])
+        for row in rows:
+            eid, amount, category, desc, date = row
+            w.writerow([amount, category, desc or "", date[:10]])
     await update.message.reply_document(document=open(fn, "rb"), caption="📤 Экспорт трат")
     os.remove(fn)
 
@@ -1073,14 +1235,17 @@ async def edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ==================== UNIFIED TEXT HANDLER ====================
 async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Единый обработчик текстовых сообщений для скриншот-флоу."""
+    """Единый обработчик текстовых сообщений для скриншот-флоу.
+    Срабатывает ТОЛЬКО когда нет активного ConversationHandler."""
     state = context.user_data.get("state")
     
     if state == STATE_SCREENSHOT_DATE:
         await handle_screenshot_date(update, context)
     elif state == STATE_SCREENSHOT_EDIT_AMOUNT:
         await handle_screenshot_amount(update, context)
-    # Остальные текстовые сообщения обрабатываются ConversationHandler'ами
+    else:
+        # Не в скриншот-флоу — игнорируем (ConversationHandler'ы сработают сами)
+        pass
 
 # ==================== WEB SERVER ====================
 async def health(request):
@@ -1114,6 +1279,7 @@ def main():
     init_db()
     ptb_app = Application.builder().token(BOT_TOKEN).build()
 
+    # === CommandHandler'ы — ВЫСШИЙ ПРИОРИТЕТ ===
     ptb_app.add_handler(CommandHandler("start", start))
     ptb_app.add_handler(CommandHandler("week", week_report))
     ptb_app.add_handler(CommandHandler("month", month_report))
@@ -1121,6 +1287,7 @@ def main():
     ptb_app.add_handler(CommandHandler("export", export_csv))
     ptb_app.add_handler(CommandHandler("cancel", cancel_cmd))
 
+    # === ConversationHandler'ы ===
     ptb_app.add_handler(ConversationHandler(
         entry_points=[CommandHandler("setcategory", setcategory_start)],
         states={
@@ -1151,7 +1318,16 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel_cmd)],
     ))
 
-    # Скриншот-флоу
+    # Импорт CSV
+    ptb_app.add_handler(ConversationHandler(
+        entry_points=[CommandHandler("import", import_start)],
+        states={
+            WAITING_IMPORT_FILE: [MessageHandler(filters.Document.ALL, import_file)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_cmd)],
+    ))
+
+    # === Скриншот-флоу ===
     ptb_app.add_handler(MessageHandler(filters.PHOTO, process_screenshot))
     
     # Callback-обработчики скриншот-флоу
@@ -1161,8 +1337,8 @@ def main():
     ptb_app.add_handler(CallbackQueryHandler(screenshot_delete_callback, pattern=r"^ssdel_"))
     ptb_app.add_handler(CallbackQueryHandler(screenshot_amount_callback, pattern=r"^ssamt_"))
     
-    # Единый обработчик текстовых сообщений для скриншот-флоу
-    # Должен быть ПОСЛЕ ConversationHandler'ов, но он проверяет state внутри
+    # === Единый обработчик текстовых сообщений — САМЫЙ НИЗКИЙ ПРИОРИТЕТ ===
+    # Срабатывает только для скриншот-флоу, когда нет активного ConversationHandler
     ptb_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
 
     aio_app = web.Application()
