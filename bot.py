@@ -1,5 +1,6 @@
 import os
 import re
+import sqlite3
 import csv
 import base64
 import logging
@@ -8,7 +9,6 @@ from typing import Optional, List, Tuple
 from io import BytesIO
 
 import aiohttp
-import psycopg2
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -26,7 +26,9 @@ from PIL import Image
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 YANDEX_API_KEY = os.environ.get("YANDEX_API_KEY")
 YANDEX_FOLDER_ID = os.environ.get("YANDEX_FOLDER_ID")
-DATABASE_URL = os.environ.get("DATABASE_URL")
+
+# Volume path для Railway (не сбрасывается при redeploy)
+DB_PATH = "/app/data/expenses.db"
 
 # Состояния
 WAITING_AMOUNT, WAITING_CATEGORY, WAITING_NEW_CATEGORY, \
@@ -45,27 +47,24 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ==================== DB ====================
-def get_conn():
-    return psycopg2.connect(DATABASE_URL, sslmode='disable')
-
-
 def init_db():
-    conn = get_conn()
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("""
         CREATE TABLE IF NOT EXISTS expenses (
-            id SERIAL PRIMARY KEY,
-            user_id BIGINT NOT NULL,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
             amount REAL NOT NULL,
             category TEXT NOT NULL,
             description TEXT,
-            date TIMESTAMP NOT NULL,
+            date TEXT NOT NULL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
     c.execute("""
         CREATE TABLE IF NOT EXISTS user_categories (
-            user_id BIGINT NOT NULL,
+            user_id INTEGER NOT NULL,
             category TEXT NOT NULL,
             PRIMARY KEY (user_id, category)
         )
@@ -74,9 +73,9 @@ def init_db():
     conn.close()
 
 def get_user_categories(user_id: int) -> List[str]:
-    conn = get_conn()
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT category FROM user_categories WHERE user_id = %s", (user_id,))
+    c.execute("SELECT category FROM user_categories WHERE user_id = ?", (user_id,))
     custom = [r[0] for r in c.fetchall()]
     conn.close()
     
@@ -91,35 +90,35 @@ def get_user_categories(user_id: int) -> List[str]:
     return result
 
 def add_user_category(user_id: int, category: str):
-    conn = get_conn()
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("INSERT INTO user_categories (user_id, category) VALUES (%s, %s) ON CONFLICT DO NOTHING", (user_id, category))
+    c.execute("INSERT OR IGNORE INTO user_categories (user_id, category) VALUES (?, ?)", (user_id, category))
     conn.commit()
     conn.close()
 
 def add_expense(user_id: int, amount: float, category: str, description: str = "", date: Optional[str] = None):
-    conn = get_conn()
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     d = date or datetime.now().isoformat()
     c.execute(
-        "INSERT INTO expenses (user_id, amount, category, description, date) VALUES (%s, %s, %s, %s, %s)",
+        "INSERT INTO expenses (user_id, amount, category, description, date) VALUES (?, ?, ?, ?, ?)",
         (user_id, amount, category, description, d),
     )
     conn.commit()
     conn.close()
 
 def get_expenses(user_id: int, days: Optional[int] = None):
-    conn = get_conn()
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     if days:
         since = (datetime.now() - timedelta(days=days)).isoformat()
         c.execute(
-            "SELECT id, amount, category, description, date FROM expenses WHERE user_id = %s AND date > %s ORDER BY date DESC",
+            "SELECT id, amount, category, description, date FROM expenses WHERE user_id = ? AND date > ? ORDER BY date DESC",
             (user_id, since),
         )
     else:
         c.execute(
-            "SELECT id, amount, category, description, date FROM expenses WHERE user_id = %s ORDER BY date DESC",
+            "SELECT id, amount, category, description, date FROM expenses WHERE user_id = ? ORDER BY date DESC",
             (user_id,),
         )
     rows = c.fetchall()
@@ -127,10 +126,10 @@ def get_expenses(user_id: int, days: Optional[int] = None):
     return rows
 
 def get_expense_by_id(expense_id: int, user_id: int):
-    conn = get_conn()
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute(
-        "SELECT id, amount, category, description, date FROM expenses WHERE id = %s AND user_id = %s",
+        "SELECT id, amount, category, description, date FROM expenses WHERE id = ? AND user_id = ?",
         (expense_id, user_id),
     )
     row = c.fetchone()
@@ -138,31 +137,31 @@ def get_expense_by_id(expense_id: int, user_id: int):
     return row
 
 def update_expense(expense_id: int, user_id: int, field: str, value):
-    conn = get_conn()
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute(
-        f"UPDATE expenses SET {field} = %s WHERE id = %s AND user_id = %s",
+        f"UPDATE expenses SET {field} = ? WHERE id = ? AND user_id = ?",
         (value, expense_id, user_id),
     )
     conn.commit()
     conn.close()
 
 def delete_expense(expense_id: int, user_id: int):
-    conn = get_conn()
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("DELETE FROM expenses WHERE id = %s AND user_id = %s", (expense_id, user_id))
+    c.execute("DELETE FROM expenses WHERE id = ? AND user_id = ?", (expense_id, user_id))
     conn.commit()
     conn.close()
 
 def get_summary_by_category(user_id: int, days: int):
-    conn = get_conn()
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     since = (datetime.now() - timedelta(days=days)).isoformat()
     c.execute(
         """
         SELECT category, SUM(amount), COUNT(*) 
         FROM expenses 
-        WHERE user_id = %s AND date > %s 
+        WHERE user_id = ? AND date > ? 
         GROUP BY category 
         ORDER BY SUM(amount) DESC
         """,
