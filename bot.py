@@ -27,7 +27,6 @@ YANDEX_FOLDER_ID = os.environ.get("YANDEX_FOLDER_ID")
 
 DB_PATH = "/app/data/expenses.db"
 
-# Единые состояния для ВСЕХ флоу
 STATE_IDLE = "idle"
 STATE_ADD_AMOUNT = "add_amount"
 STATE_ADD_CATEGORY = "add_category"
@@ -44,7 +43,7 @@ STATE_SCREENSHOT_DELETE = "screenshot_delete"
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
+    level=logging.DEBUG,  # DEBUG для максимального логирования
 )
 logger = logging.getLogger(__name__)
 
@@ -234,12 +233,9 @@ def parse_bank_screenshot(text: str) -> Tuple[Optional[str], List[Tuple[str, flo
     }
     
     def extract_amount(s: str) -> Optional[float]:
-        # Убираем знак + в начале — это доход
         if re.match(r'^\s*\+', s):
             return None
         
-        # Ищем число с/без ₽
-        # Сначала ищем полный паттерн с ₽
         patterns = [
             r'[-–]?\s*([\d\s]+[.,]\d{2})\s*[₽PРp]',
             r'[-–]?\s*([\d\s]+)\s*[₽PРp]',
@@ -252,7 +248,6 @@ def parse_bank_screenshot(text: str) -> Tuple[Optional[str], List[Tuple[str, flo
                 try:
                     val = m.group(1).replace(" ", "").replace(",", ".")
                     f = abs(float(val))
-                    # Фильтруем явно неверные значения
                     if f > 0 and f < 1000000:
                         return f
                 except ValueError:
@@ -260,22 +255,18 @@ def parse_bank_screenshot(text: str) -> Tuple[Optional[str], List[Tuple[str, flo
         return None
     
     def is_service_line(line: str) -> bool:
-        """Проверяет, является ли строка служебной (UI элемент банка)."""
         line_lower = line.lower().strip()
         
-        # Точные совпадения — UI-элементы
         exact_service = {
             "переводы", "двойной чёрный", "двойной черный", "дебетовая карта",
             "местный транспорт", "перевод", "зачисление", "доходы", "траты",
             "счета и карты", "без переводов", "операции", "все операции",
             "счёт", "карта", "остаток", "баланс", "пополнение", "зачисление",
             "входящий", "возврат", "кэшбэк", ")", "(", "+1", "+2", "+3",
-            "двойной чёрный", "двойной черный",
         }
         if line_lower in exact_service:
             return True
         
-        # Заголовки секций
         section_headers = {
             "счета и карты", "без переводов", "все операции", "операции",
             "доходы", "траты", "переводы", "остаток", "баланс",
@@ -283,7 +274,6 @@ def parse_bank_screenshot(text: str) -> Tuple[Optional[str], List[Tuple[str, flo
         if line_lower in section_headers:
             return True
         
-        # Категории-заголовки (короткие, без сумм)
         category_headers = {
             "супермаркеты", "кафе и рестораны", "развлечения", "здоровье",
             "одежда", "коммунальные", "связь", "образование", "спорт",
@@ -292,18 +282,16 @@ def parse_bank_screenshot(text: str) -> Tuple[Optional[str], List[Tuple[str, flo
         if line_lower in category_headers:
             return True
         
-        # Проверяем "транспорт" — если в строке есть сумма, это трата, не заголовок
-        if "транспорт" in line_lower:
-            # Если в строке есть сумма — это реальная трата
-            if extract_amount(line) is not None:
-                return False
-            # Если строка очень короткая — скорее всего заголовок категории
-            if len(line_lower) < 25:
-                return True
-        
-        # "Местный транспорт" — всегда служебная строка (категория в банке)
+        # "Местный транспорт" — всегда служебная
         if "местный транспорт" in line_lower:
             return True
+        
+        # "Городской транспорт" — если есть сумма, это трата
+        if "транспорт" in line_lower:
+            if extract_amount(line) is not None:
+                return False
+            if len(line_lower) < 30:
+                return True
         
         return False
     
@@ -315,12 +303,10 @@ def parse_bank_screenshot(text: str) -> Tuple[Optional[str], List[Tuple[str, flo
     while i < len(lines):
         line = lines[i]
         
-        # Пропускаем доходы
         if is_income(line):
             i += 1
             continue
         
-        # Ищем дату
         found_date = False
         for pattern, ptype in date_patterns:
             m = re.match(pattern, line, re.IGNORECASE)
@@ -347,26 +333,20 @@ def parse_bank_screenshot(text: str) -> Tuple[Optional[str], List[Tuple[str, flo
             i += 1
             continue
         
-        # Пытаемся найти пару: описание + сумма
         if not is_service_line(line) and not is_income(line) and i + 1 < len(lines):
             next_line = lines[i + 1]
             
-            # Если следующая строка — доход, пропускаем пару
             if is_income(next_line):
                 i += 2
                 continue
             
-            # Пробуем извлечь сумму из следующей строки
             amount = extract_amount(next_line)
             
             if amount and amount > 0:
                 desc = line
                 i += 2
-                
-                # Пропускаем служебные строки после траты
                 while i < len(lines) and (is_service_line(lines[i]) or is_income(lines[i])):
                     i += 1
-                
                 expenses.append((desc, amount))
                 continue
         
@@ -394,6 +374,7 @@ def guess_category(description: str, user_categories: List[str]) -> str:
 
 # ==================== SCREENSHOT FLOW ====================
 async def process_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info(f"PHOTO received from user {update.message.from_user.id}")
     user_id = update.message.from_user.id
     
     state = context.user_data.get("state", STATE_IDLE)
@@ -420,7 +401,9 @@ async def process_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         return
     
+    logger.info(f"OCR text length: {len(text)}")
     parsed_date, expenses = parse_bank_screenshot(text)
+    logger.info(f"Parsed: date={parsed_date}, expenses={len(expenses)}")
     
     if not expenses:
         await update.message.reply_text(
@@ -897,11 +880,13 @@ def clear_screenshot_data(context: ContextTypes.DEFAULT_TYPE):
 
 # ==================== ADD EXPENSE MANUALLY ====================
 async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info(f"CMD /add from user {update.message.from_user.id}")
     clear_screenshot_data(context)
     context.user_data["state"] = STATE_ADD_AMOUNT
     await update.message.reply_text("Введи сумму (250.50):")
 
 async def handle_add_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info(f"handle_add_amount called, state={context.user_data.get('state')}")
     if context.user_data.get("state") != STATE_ADD_AMOUNT:
         return
     
@@ -933,6 +918,7 @@ async def add_category_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
 # ==================== CUSTOM CATEGORIES ====================
 async def cmd_setcategory(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info(f"CMD /setcategory from user {update.message.from_user.id}")
     clear_screenshot_data(context)
     context.user_data["state"] = STATE_SETCATEGORY
     await update.message.reply_text(
@@ -942,6 +928,7 @@ async def cmd_setcategory(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def handle_setcategory(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info(f"handle_setcategory called, state={context.user_data.get('state')}")
     if context.user_data.get("state") != STATE_SETCATEGORY:
         return
     
@@ -960,6 +947,7 @@ async def handle_setcategory(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 # ==================== LIST & EDIT ====================
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info(f"CMD /list from user {update.message.from_user.id}")
     clear_screenshot_data(context)
     uid = update.message.from_user.id
     rows = get_expenses(uid, 30)
@@ -1029,6 +1017,7 @@ async def edit_field_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     await query.edit_message_text(f"Введи новую {names.get(field, field)}:")
 
 async def edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info(f"edit_value called, state={context.user_data.get('state')}")
     if context.user_data.get("state") != STATE_LIST_VALUE:
         return
     
@@ -1052,6 +1041,7 @@ async def edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ==================== IMPORT CSV ====================
 async def cmd_import(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info(f"CMD /import from user {update.message.from_user.id}")
     clear_screenshot_data(context)
     context.user_data["state"] = STATE_IMPORT
     await update.message.reply_text(
@@ -1065,6 +1055,7 @@ async def cmd_import(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def handle_import_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info(f"handle_import_file called, state={context.user_data.get('state')}")
     if context.user_data.get("state") != STATE_IMPORT:
         return
     
@@ -1208,6 +1199,7 @@ async def handle_import_file(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 # ==================== REPORTS ====================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info(f"CMD /start from user {update.message.from_user.id}")
     clear_screenshot_data(context)
     cats = get_user_categories(update.message.from_user.id)
     await update.message.reply_text(
@@ -1224,6 +1216,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def cmd_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info(f"CMD /week from user {update.message.from_user.id}")
     clear_screenshot_data(context)
     uid = update.message.from_user.id
     total = sum(r[1] for r in get_expenses(uid, 7))
@@ -1234,6 +1227,7 @@ async def cmd_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text or "Нет трат за неделю.", parse_mode="Markdown")
 
 async def cmd_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info(f"CMD /month from user {update.message.from_user.id}")
     clear_screenshot_data(context)
     uid = update.message.from_user.id
     total = sum(r[1] for r in get_expenses(uid, 30))
@@ -1244,6 +1238,7 @@ async def cmd_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text or "Нет трат за месяц.", parse_mode="Markdown")
 
 async def cmd_categories(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info(f"CMD /categories from user {update.message.from_user.id}")
     clear_screenshot_data(context)
     uid = update.message.from_user.id
     by_cat = get_summary_by_category(uid, 30)
@@ -1256,6 +1251,7 @@ async def cmd_categories(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode="Markdown")
 
 async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info(f"CMD /export from user {update.message.from_user.id}")
     clear_screenshot_data(context)
     uid = update.message.from_user.id
     rows = get_expenses(uid)
@@ -1273,24 +1269,22 @@ async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
     os.remove(fn)
 
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info(f"CMD /cancel from user {update.message.from_user.id}, state was {context.user_data.get('state')}")
     clear_screenshot_data(context)
     context.user_data["state"] = STATE_IDLE
     await update.message.reply_text("✅ Операция отменена.")
 
 # ==================== UNIFIED MESSAGE HANDLER ====================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Единый обработчик всех текстовых сообщений и документов.
-    Маршрутизирует в нужный обработчик по состоянию."""
+    """Единый обработчик всех текстовых сообщений и документов."""
     state = context.user_data.get("state", STATE_IDLE)
+    logger.info(f"handle_message: state={state}, text={update.message.text[:50] if update.message.text else 'None'}")
     
-    # Если пользователь отправил документ в режиме импорта
     if update.message.document and state == STATE_IMPORT:
         await handle_import_file(update, context)
         return
     
-    # Текстовые сообщения по состояниям
     if state == STATE_IDLE:
-        # Не в активном флоу — игнорируем текст (или можно ответить подсказкой)
         return
     elif state == STATE_ADD_AMOUNT:
         await handle_add_amount(update, context)
@@ -1302,8 +1296,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_screenshot_date(update, context)
     elif state == STATE_SCREENSHOT_EDIT_AMOUNT:
         await handle_screenshot_amount(update, context)
-    # STATE_ADD_CATEGORY, STATE_LIST_SELECT, STATE_LIST_FIELD — обрабатываются через callback
-    # STATE_SCREENSHOT_CONFIRM, STATE_SCREENSHOT_EDIT_CAT, STATE_SCREENSHOT_DELETE — через callback
+    else:
+        logger.warning(f"Unknown state: {state}")
 
 # ==================== WEB SERVER ====================
 async def health(request):
@@ -1314,30 +1308,37 @@ async def webhook(request):
     try:
         data = await request.json()
         update = Update.de_json(data, app.bot)
+        logger.info(f"Webhook received: update_id={update.update_id}, message={update.message is not None}, callback_query={update.callback_query is not None}")
         await app.process_update(update)
+        logger.info(f"Webhook processed successfully")
         return web.Response(text="OK")
     except Exception as e:
-        logger.error(f"Webhook error: {e}")
+        logger.error(f"Webhook error: {e}", exc_info=True)
         return web.Response(status=500)
 
 async def on_startup(app):
+    logger.info("=== ON STARTUP ===")
     await app['ptb_app'].initialize()
     await app['ptb_app'].start()
+    logger.info("PTB app started")
     host = os.environ.get("RAILWAY_PUBLIC_DOMAIN") or os.environ.get("RENDER_EXTERNAL_HOSTNAME")
     if host:
         url = f"https://{host}/webhook"
         await app['ptb_app'].bot.set_webhook(url)
-        logger.info(f"Webhook: {url}")
+        logger.info(f"Webhook set: {url}")
 
 async def on_cleanup(app):
+    logger.info("=== ON CLEANUP ===")
     await app['ptb_app'].stop()
     await app['ptb_app'].shutdown()
 
 def main():
+    logger.info("=== MAIN START ===")
     init_db()
     ptb_app = Application.builder().token(BOT_TOKEN).build()
+    logger.info(f"PTB app built, handlers count: {len(ptb_app.handlers)}")
 
-    # === CommandHandler'ы — ВЫСШИЙ ПРИОРИТЕТ ===
+    # === CommandHandler'ы ===
     ptb_app.add_handler(CommandHandler("start", cmd_start))
     ptb_app.add_handler(CommandHandler("add", cmd_add))
     ptb_app.add_handler(CommandHandler("list", cmd_list))
@@ -1348,6 +1349,7 @@ def main():
     ptb_app.add_handler(CommandHandler("categories", cmd_categories))
     ptb_app.add_handler(CommandHandler("export", cmd_export))
     ptb_app.add_handler(CommandHandler("cancel", cmd_cancel))
+    logger.info(f"Command handlers added, total handlers: {len(ptb_app.handlers)}")
 
     # === CallbackQueryHandler'ы ===
     ptb_app.add_handler(CallbackQueryHandler(add_category_callback, pattern=r"^addcat_"))
@@ -1360,11 +1362,12 @@ def main():
     ptb_app.add_handler(CallbackQueryHandler(screenshot_category_callback, pattern=r"^sscat_"))
     ptb_app.add_handler(CallbackQueryHandler(screenshot_delete_callback, pattern=r"^ssdel_"))
     ptb_app.add_handler(CallbackQueryHandler(screenshot_amount_callback, pattern=r"^ssamt_"))
+    logger.info(f"Callback handlers added, total handlers: {len(ptb_app.handlers)}")
 
-    # === MessageHandler'ы — САМЫЙ НИЗКИЙ ПРИОРИТЕТ ===
+    # === MessageHandler'ы ===
     ptb_app.add_handler(MessageHandler(filters.PHOTO, process_screenshot))
-    # Единый обработчик для ВСЕХ текстовых сообщений и документов
     ptb_app.add_handler(MessageHandler(filters.TEXT | filters.Document.ALL, handle_message))
+    logger.info(f"Message handlers added, total handlers: {len(ptb_app.handlers)}")
 
     aio_app = web.Application()
     aio_app['ptb_app'] = ptb_app
@@ -1374,6 +1377,7 @@ def main():
     aio_app.on_cleanup.append(on_cleanup)
 
     port = int(os.environ.get("PORT", "8080"))
+    logger.info(f"Starting web server on port {port}")
     web.run_app(aio_app, host="0.0.0.0", port=port)
 
 if __name__ == "__main__":
