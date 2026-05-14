@@ -20,24 +20,24 @@ from telegram.ext import (
     filters,
 )
 from aiohttp import web
-from PIL import Image
 
 # ==================== CONFIG ====================
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 YANDEX_API_KEY = os.environ.get("YANDEX_API_KEY")
 YANDEX_FOLDER_ID = os.environ.get("YANDEX_FOLDER_ID")
 
-# Volume path для Railway (не сбрасывается при redeploy)
 DB_PATH = "/app/data/expenses.db"
 
-# Состояния
+# Состояния ConversationHandler
 WAITING_AMOUNT, WAITING_CATEGORY, WAITING_NEW_CATEGORY, \
 WAITING_EDIT_SELECT, WAITING_EDIT_FIELD, WAITING_EDIT_VALUE = range(6)
 
+# Состояния скриншот-флоу (храним в user_data["state"])
 STATE_IDLE = "idle"
 STATE_SCREENSHOT_DATE = "screenshot_date"
 STATE_SCREENSHOT_CONFIRM = "screenshot_confirm"
 STATE_SCREENSHOT_EDIT_CAT = "screenshot_edit_cat"
+STATE_SCREENSHOT_EDIT_AMOUNT = "screenshot_edit_amount"
 STATE_SCREENSHOT_DELETE = "screenshot_delete"
 
 logging.basicConfig(
@@ -252,15 +252,48 @@ def parse_bank_screenshot(text: str) -> Tuple[Optional[str], List[Tuple[str, flo
         return None
     
     def is_service_line(line: str) -> bool:
-        service_words = [
+        """Служебные строки — заголовки, категории, UI-элементы банковского приложения.
+        НЕ отбрасываем реальные траты, даже если в описании есть слово 'транспорт'."""
+        line_lower = line.lower().strip()
+        
+        # Точные совпадения — UI-элементы
+        exact_service = [
             "переводы", "двойной чёрный", "дебетовая карта", "супермаркеты",
             "местный транспорт", "перевод", "зачисление", "доходы", "траты",
             "счета и карты", "без переводов", "операции", "все операции",
             "счёт", "карта", "остаток", "баланс", "пополнение", "зачисление",
-            "входящий", "возврат", "кэшбэк"
+            "входящий", "возврат", "кэшбэк", ")", "(", "+1", "+2", "+3"
         ]
-        line_lower = line.lower()
-        return any(sw in line_lower for sw in service_words) or line in ["+1", "+2", "+3", ")", "("]
+        if line_lower in exact_service:
+            return True
+        
+        # Заголовки секций (обычно короткие, без сумм)
+        section_headers = [
+            "счета и карты", "без переводов", "все операции", "операции",
+            "доходы", "траты", "переводы", "остаток", "баланс"
+        ]
+        if line_lower in section_headers:
+            return True
+        
+        # Если строка содержит "транспорт" — проверяем, это заголовок категории или реальная трата
+        # Заголовки категорий обычно короткие и без сумм
+        if "транспорт" in line_lower:
+            # Если в строке есть сумма — это реальная трата
+            if extract_amount(line) is not None:
+                return False
+            # Если строка очень короткая — скорее всего заголовок категории
+            if len(line_lower) < 25:
+                return True
+        
+        # Другие категории-заголовки (короткие, без сумм)
+        category_headers = [
+            "супермаркеты", "кафе и рестораны", "развлечения", "здоровье",
+            "одежда", "коммунальные", "связь", "образование", "спорт"
+        ]
+        if line_lower in category_headers:
+            return True
+        
+        return False
     
     def is_income(line: str) -> bool:
         income_markers = ["зачисление", "пополнение", "возврат", "кэшбэк", "доход", "зарплата", "перевод от"]
@@ -325,7 +358,7 @@ def guess_category(description: str, user_categories: List[str]) -> str:
     desc_lower = description.lower()
     keywords = {
         "Продукты": ["продукт", "пятероч", "магнит", "перекрест", "азбука", "лента", " Spar ", "вкусно", "еда", "овощ", "мясо", "молоко", "хлеб", "овощи", "фрукты", "супермаркет", "гипер", "покупка", "магазин", "торговый центр"],
-        "Транспорт": ["такси", "метро", "автобус", "трамвай", "электричк", "поезд", "билет", "яндекс такси", "uber", "ситимобил", "бензин", "заправк", "парковка", "транспорт", "городской транспорт", "местный транспорт", "ярослав"],
+        "Транспорт": ["такси", "метро", "автобус", "трамвай", "электричк", "поезд", "билет", "яндекс такси", "uber", "ситимобил", "бензин", "заправк", "парковка", "транспорт", "городской транспорт", "ярослав"],
         "Кафе": ["кафе", "ресторан", "кофе", "кофейня", "шоколадница", "старбакс", "kfc", "макдоналдс", "бургер", "пицца", "суши", "доставка", "обед", "ужин", "покушать", "поесть", "двойной чёрный", "чёрный", "капучино", "латте"],
         "Развлечения": ["кино", "театр", "концерт", "игра", "steam", "playstation", "xbox", "книг", "подписка", "netflix", "spotify", "музыка", "развлеч"],
         "Здоровье": ["аптек", "лекарств", "врач", "больниц", "клиник", "анализ", "массаж", "стоматолог", "зуб", "терапевт", "медицин", "здоровье"],
@@ -485,6 +518,7 @@ async def show_confirm_screen(query, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [InlineKeyboardButton("✅ Сохранить все", callback_data="ss_save_all")],
         [InlineKeyboardButton("📝 Изменить категории", callback_data="ss_edit_cats")],
+        [InlineKeyboardButton("💰 Изменить суммы", callback_data="ss_edit_amounts")],
         [InlineKeyboardButton("🗑 Удалить траты", callback_data="ss_delete")],
         [InlineKeyboardButton("📅 Изменить дату", callback_data="ss_change_date")],
         [InlineKeyboardButton("❌ Отмена", callback_data="ss_cancel")],
@@ -508,6 +542,7 @@ async def show_confirm_message(update: Update, context: ContextTypes.DEFAULT_TYP
     keyboard = [
         [InlineKeyboardButton("✅ Сохранить все", callback_data="ss_save_all")],
         [InlineKeyboardButton("📝 Изменить категории", callback_data="ss_edit_cats")],
+        [InlineKeyboardButton("💰 Изменить суммы", callback_data="ss_edit_amounts")],
         [InlineKeyboardButton("🗑 Удалить траты", callback_data="ss_delete")],
         [InlineKeyboardButton("📅 Изменить дату", callback_data="ss_change_date")],
         [InlineKeyboardButton("❌ Отмена", callback_data="ss_cancel")],
@@ -576,6 +611,20 @@ async def screenshot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         context.user_data["ss_categories"] = [guess_category(e[0], get_user_categories(query.from_user.id)) for e in expenses]
         context.user_data["state"] = STATE_SCREENSHOT_EDIT_CAT
         await show_category_selector(query, context)
+        return
+    
+    if action == "ss_edit_amounts":
+        expenses = context.user_data.get("screenshot_expenses", [])
+        if not expenses:
+            await query.edit_message_text("❌ Ошибка.")
+            clear_screenshot_data(context)
+            return
+        
+        context.user_data["ss_edit_index"] = 0
+        context.user_data["ss_amounts"] = [amount for _, amount in expenses]
+        context.user_data["state"] = STATE_SCREENSHOT_EDIT_AMOUNT
+        await show_amount_editor(query, context)
+        return
     
     if action == "ss_delete":
         expenses = context.user_data.get("screenshot_expenses", [])
@@ -639,26 +688,112 @@ async def screenshot_delete_callback(update: Update, context: ContextTypes.DEFAU
     
     await show_delete_selector(query, context)
 
-async def screenshot_category_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    category = query.data.replace("sscat_", "")
-    
+# ==================== EDIT AMOUNTS ====================
+async def show_amount_editor(query, context: ContextTypes.DEFAULT_TYPE):
     idx = context.user_data.get("ss_edit_index", 0)
     expenses = context.user_data.get("screenshot_expenses", [])
     
     if idx >= len(expenses):
-        await save_all_after_edit(query, context)
+        # Все суммы отредактированы, переходим к подтверждению
+        await show_confirm_screen(query, context)
         return
     
-    context.user_data["ss_categories"][idx] = category
+    desc, amount = expenses[idx]
+    
+    keyboard = [
+        [InlineKeyboardButton("✅ Оставить как есть", callback_data=f"ssamt_keep")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="ss_cancel")],
+    ]
+    
+    await query.edit_message_text(
+        f"💰 Трата {idx+1}/{len(expenses)}:\n*{desc}*\nТекущая сумма: *{amount:.2f} ₽*\n\n"
+        f"Введи новую сумму или нажми 'Оставить как есть':",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+
+async def screenshot_amount_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    action = query.data
+    
+    if action == "ss_cancel":
+        await query.edit_message_text("❌ Отменено.")
+        clear_screenshot_data(context)
+        return
+    
+    if action == "ssamt_keep":
+        idx = context.user_data.get("ss_edit_index", 0)
+        context.user_data["ss_edit_index"] = idx + 1
+        
+        expenses = context.user_data.get("screenshot_expenses", [])
+        if context.user_data["ss_edit_index"] >= len(expenses):
+            await show_confirm_screen(query, context)
+        else:
+            await show_amount_editor(query, context)
+        return
+
+async def handle_screenshot_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    state = context.user_data.get("state")
+    
+    if state != STATE_SCREENSHOT_EDIT_AMOUNT:
+        return
+    
+    text = update.message.text.strip().replace(",", ".").replace(" ", "")
+    
+    try:
+        new_amount = float(text)
+        if new_amount <= 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("❌ Неверный формат. Введи положительное число:")
+        return
+    
+    idx = context.user_data.get("ss_edit_index", 0)
+    expenses = context.user_data.get("screenshot_expenses", [])
+    
+    if idx < len(expenses):
+        desc, _ = expenses[idx]
+        expenses[idx] = (desc, new_amount)
+        context.user_data["screenshot_expenses"] = expenses
+        
+        # Обновляем суммы в контексте
+        amounts = context.user_data.get("ss_amounts", [])
+        if idx < len(amounts):
+            amounts[idx] = new_amount
+            context.user_data["ss_amounts"] = amounts
+    
     context.user_data["ss_edit_index"] = idx + 1
     
     if context.user_data["ss_edit_index"] >= len(expenses):
-        await save_all_after_edit(query, context)
+        await update.message.reply_text("✅ Все суммы отредактированы.")
+        await show_confirm_message(update, context)
     else:
-        await show_category_selector(query, context)
+        await show_amount_editor_message(update, context)
 
+async def show_amount_editor_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    idx = context.user_data.get("ss_edit_index", 0)
+    expenses = context.user_data.get("screenshot_expenses", [])
+    
+    if idx >= len(expenses):
+        await show_confirm_message(update, context)
+        return
+    
+    desc, amount = expenses[idx]
+    
+    keyboard = [
+        [InlineKeyboardButton("✅ Оставить как есть", callback_data=f"ssamt_keep")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="ss_cancel")],
+    ]
+    
+    await update.message.reply_text(
+        f"💰 Трата {idx+1}/{len(expenses)}:\n*{desc}*\nТекущая сумма: *{amount:.2f} ₽*\n\n"
+        f"Введи новую сумму или нажми 'Оставить как есть':",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+
+# ==================== EDIT CATEGORIES ====================
 async def show_category_selector(query, context: ContextTypes.DEFAULT_TYPE):
     idx = context.user_data.get("ss_edit_index", 0)
     expenses = context.user_data.get("screenshot_expenses", [])
@@ -679,11 +814,45 @@ async def show_category_selector(query, context: ContextTypes.DEFAULT_TYPE):
             row.append(InlineKeyboardButton(f"{prefix}{cat}", callback_data=f"sscat_{cat}"))
         keyboard.append(row)
     
+    keyboard.append([InlineKeyboardButton("💰 Изменить сумму", callback_data="sscat_edit_amount")])
+    
     await query.edit_message_text(
         f"📝 Трата {idx+1}/{len(expenses)}:\n*{desc}* — {amount:.2f} ₽\n\nВыбери категорию:",
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown"
     )
+
+async def screenshot_category_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    action = query.data
+    
+    if action == "ss_cancel":
+        await query.edit_message_text("❌ Отменено.")
+        clear_screenshot_data(context)
+        return
+    
+    if action == "sscat_edit_amount":
+        # Переключаемся на редактирование суммы для текущей траты
+        context.user_data["state"] = STATE_SCREENSHOT_EDIT_AMOUNT
+        await show_amount_editor(query, context)
+        return
+    
+    category = action.replace("sscat_", "")
+    idx = context.user_data.get("ss_edit_index", 0)
+    expenses = context.user_data.get("screenshot_expenses", [])
+    
+    if idx >= len(expenses):
+        await save_all_after_edit(query, context)
+        return
+    
+    context.user_data["ss_categories"][idx] = category
+    context.user_data["ss_edit_index"] = idx + 1
+    
+    if context.user_data["ss_edit_index"] >= len(expenses):
+        await save_all_after_edit(query, context)
+    else:
+        await show_category_selector(query, context)
 
 async def save_all_after_edit(query, context: ContextTypes.DEFAULT_TYPE):
     expenses = context.user_data.get("screenshot_expenses", [])
@@ -705,7 +874,7 @@ async def save_all_after_edit(query, context: ContextTypes.DEFAULT_TYPE):
 
 def clear_screenshot_data(context: ContextTypes.DEFAULT_TYPE):
     keys = ["screenshot_expenses", "screenshot_date", "screenshot_text", "parsed_date", 
-            "ss_categories", "ss_edit_index", "ss_deleted", "state"]
+            "ss_categories", "ss_edit_index", "ss_deleted", "ss_amounts", "state"]
     for key in keys:
         context.user_data.pop(key, None)
 
@@ -902,6 +1071,17 @@ async def edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"✅ Категория: {val}")
     return ConversationHandler.END
 
+# ==================== UNIFIED TEXT HANDLER ====================
+async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Единый обработчик текстовых сообщений для скриншот-флоу."""
+    state = context.user_data.get("state")
+    
+    if state == STATE_SCREENSHOT_DATE:
+        await handle_screenshot_date(update, context)
+    elif state == STATE_SCREENSHOT_EDIT_AMOUNT:
+        await handle_screenshot_amount(update, context)
+    # Остальные текстовые сообщения обрабатываются ConversationHandler'ами
+
 # ==================== WEB SERVER ====================
 async def health(request):
     return web.Response(text="Bot OK")
@@ -971,13 +1151,19 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel_cmd)],
     ))
 
+    # Скриншот-флоу
     ptb_app.add_handler(MessageHandler(filters.PHOTO, process_screenshot))
-    ptb_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_screenshot_date))
     
+    # Callback-обработчики скриншот-флоу
     ptb_app.add_handler(CallbackQueryHandler(screenshot_date_callback, pattern=r"^ssdate_"))
     ptb_app.add_handler(CallbackQueryHandler(screenshot_callback, pattern=r"^ss_"))
     ptb_app.add_handler(CallbackQueryHandler(screenshot_category_callback, pattern=r"^sscat_"))
     ptb_app.add_handler(CallbackQueryHandler(screenshot_delete_callback, pattern=r"^ssdel_"))
+    ptb_app.add_handler(CallbackQueryHandler(screenshot_amount_callback, pattern=r"^ssamt_"))
+    
+    # Единый обработчик текстовых сообщений для скриншот-флоу
+    # Должен быть ПОСЛЕ ConversationHandler'ов, но он проверяет state внутри
+    ptb_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
 
     aio_app = web.Application()
     aio_app['ptb_app'] = ptb_app
